@@ -1,0 +1,21 @@
+# Large or sensitive build artifacts: never commit
+runs/
+build/
+out/
+dist/
+*.pbf
+*.osm.pbf
+*.gph
+*.tar
+ledger/
+*.ledger
+*.sqlite
+
+# Local environment
+.env
+*.key
+*.pem
+__pycache__/
+*.pyc
+.venv/
+node_modules/
