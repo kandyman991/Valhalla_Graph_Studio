@@ -13,6 +13,8 @@ Date: 2026-11-04. Source: `kandyman991/RoadPilot-Offline-Data`, commit `f29efad`
 ## Not imported (old architecture)
 `tools/` files matching `*f8*`, `*connectiv*`, `*connector*`, `*frontier*`, `*crossing*`, `*handoff*` (29 files), `tools/legacy_archive/`, the F8 and retired-architecture documents, and the F8 / historical-fixture tests and fixtures.
 
+Also dropped after a second pass: `schemas/legacy_archive/` and `schemas/cross-region-connectivity.schema.json`, `tools/check_architecture_contract.py`, and the `CONNECTIVITY` / `CONNECTOR_*` publication kinds from the two publication schemas.
+
 ## Seed only
 `tools/native-f8-edge-scan/*.cpp` and `CMakeLists.txt` are in `native/edge-scan-seed/`, unwired.
 

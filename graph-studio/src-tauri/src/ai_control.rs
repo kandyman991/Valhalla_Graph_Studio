@@ -229,7 +229,7 @@ mod tests {
         assert_eq!(result["commands"].as_array().unwrap().len(), 4);
         assert!(!Path::new("/nonexistent").exists());
         assert!(execute(Path::new("."), "start_build_queue", None).is_err());
-        assert!(execute(Path::new("."), "delete_handoff_override", None).is_err());
+        assert!(execute(Path::new("."), "delete_build", None).is_err());
     }
 
     #[test]

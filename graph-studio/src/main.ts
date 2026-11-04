@@ -3533,8 +3533,7 @@ function clearTransientMapOverlays(): void {
   // POI result list/data is intentionally preserved. Remove its map rendering only.
   for (const id of ["search-poi-labels", "search-poi-points"]) if (map.getLayer(id)) map.removeLayer(id);
   if (map.getSource("search-poi-results")) map.removeSource("search-poi-results");
-  // The user can re-load the selected A/B pair. Saved manual crossings, editor input,
-  // displayed report files, retained graph versions and source data remain untouched.
+  // Editor input, retained graph versions and source data remain untouched.
   clearToolOverlaysBtn.textContent = "Cleared";
   window.setTimeout(() => { clearToolOverlaysBtn.textContent = "Clear"; }, 1800);
 }

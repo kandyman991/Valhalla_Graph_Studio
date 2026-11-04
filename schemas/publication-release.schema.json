@@ -26,10 +26,7 @@
       "enum": [
         "ROUTING",
         "VISUAL",
-        "SEARCH",
-        "CONNECTIVITY",
-        "CONNECTOR_INVENTORY",
-        "CONNECTOR_MATRIX"
+        "SEARCH"
       ]
     },
     "regionId": {
