@@ -3,6 +3,7 @@
 Rule for every phase: change one variable at a time, record inputs and hashes, keep the experiment reproducible. Heavy builds run locally (self-hosted machine), not in cloud CI. Documentation-only commits use `[skip ci]`.
 
 ## Phase 0 - Environment and source verification
+**Status 2026-11-04:** source reading done for Valhalla 3.6.3 (`OPEN_QUESTIONS.md`). Still to do: pin the build recipe, set up a Valhalla binary and the Andorra extract. Q4, Q7 and Q9 need experiments and move to Phases 1 and 4.
 - Pin the Valhalla version (production: 3.6.3) and record compiler, OS and config.
 - Read the pinned Valhalla source and answer every item in `OPEN_QUESTIONS.md`. Record answers with file and line references.
 - Freeze the test dataset: Andorra first (small, borders, tunnels, roundabouts), a second dataset later (two adjacent small regions for seam work).
