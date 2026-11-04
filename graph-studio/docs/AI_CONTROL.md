@@ -45,7 +45,7 @@ a Valhalla route was verified.
 Both interfaces call `ai_control::execute`:
 
 - `capabilities`: reports versioned read-only commands.
-- `diagnose`: returns schema `roadpilot.graph-studio.ai-diagnostics.v1` for retained Valhalla and border-report summaries plus sanitized last-build outcome.
+- `diagnose`: returns schema `roadpilot.graph-studio.ai-diagnostics.v1` for retained Valhalla validation summaries plus the sanitized last-build outcome.
 - `inspect`: returns schema `roadpilot.graph-studio.ai-control.v1`,
   allowlisted region summaries, bounded routing-build manifest summaries,
   warnings, and optional in-process build state.
@@ -88,10 +88,6 @@ The result contains:
   vs interior counts from retained routing manifests, Valhalla version, fingerprint,
   and whether the named routing TAR is present as a regular file. It **does not**
   rerun routes, validate archive contents or hash large TARs.
-- **Border reports:** bounded summaries of the already-exported
-  `~/ValhallaGraphStudio/reports/*.json`: two graph identities, selected
-  crossing outcome/probe counts and road overlap counts. Reports may refer to
-  stale graph versions; no automatic freshness claim is made.
 - **Last recorded build:** Graph Studio records a small
   `~/ValhallaGraphStudio/diagnostics/latest-build.json` **when a build
   finishes**, even if it fails. Fields are only package/region identifiers,
@@ -118,12 +114,12 @@ JSON fields are surfaced. To investigate the original failure text, the user
 still uses the existing Graph Studio build console.
 
 M2 adds Rust unit tests for successful/missing/failed recorded proof, prior
-border report summaries, sanitized outcome writes, absent workspaces and
+sanitized outcome writes, absent workspaces and
 symlink avoidance; existing PR CI runs these tests. No separate runner, artifact
 upload or real regional build was added.
 
 **Next:** confirm the new binary on Legion, compare `--ai-diagnose` results with
-actual manifests and border reports, and complete the pending Austria rebuild
+actual manifests, and complete the pending Austria rebuild
 smoke test. Future M3 can add explicit, permissioned graph integrity/Valhalla
 verification operations without duplicating the existing tools.
 
@@ -172,7 +168,7 @@ Security and resource boundaries:
   invocation **cannot** know if the GUI is building: caller should ensure no
   build is in progress.
 - `crossRegionProof=false`, `retainedPackHashVerified=false`: this is not
-  a border-crossing proof, exact retained-package replay or cross-region F8
+  a border-crossing proof, exact retained-package replay or cross-region
   test. These remain separate, stronger validations.
 
 This interface performs no intentional Graph Studio workspace writes; it
@@ -222,7 +218,10 @@ on the map. M3's structured `route` evidence includes `actualStart`,
 `actualEnd`, `destinationReached`, and start/end offsets.
 
 The 150 m comparison is the M3 verification tolerance; it is only a
-route-arrival assessment, NOT a newly imposed filter on Valhalla, F8
-frontier discovery or border proof. Do not conclude that incomplete
+route-arrival assessment, NOT a newly imposed filter on Valhalla or the
+border proof. Do not conclude that incomplete
 arrival was caused by the 25 km buffer without inspecting actual
 coverage and the precise routed endpoint.
+
+
+> Imported note (2026-11-04): the former border-report summaries (`borderReports`, `reports/*.json`) were removed together with the Border inspector that produced those files. Border-vs-interior counts of validation routes remain.

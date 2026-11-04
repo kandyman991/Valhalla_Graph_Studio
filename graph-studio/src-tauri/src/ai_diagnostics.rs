@@ -13,7 +13,6 @@ const OUTCOME_SCHEMA: &str = "roadpilot.graph-studio.build-outcome.v1";
 const MAX_JSON_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_DIRS: usize = 100;
 const MAX_FILES: usize = 200;
-const MAX_REPORTS: usize = 30;
 const MAX_WARNINGS: usize = 12;
 
 fn warning(warnings: &mut Vec<&'static str>, value: &'static str) {
@@ -193,68 +192,6 @@ fn safe_number(obj: &Value, pointer: &str) -> Option<u64> {
     obj.pointer(pointer).and_then(Value::as_u64)
 }
 
-fn report_summary(value: &Value) -> Option<Value> {
-    if value.get("schema").and_then(Value::as_str) != Some("roadpilot.border-diagnostics") {
-        return None;
-    }
-    let selected = value.get("selectedValidation").filter(|v| v.is_object());
-    let probes = selected.and_then(|s| s.get("probes")).and_then(Value::as_object);
-    let (probe_count, passed_probes) = probes.map_or((0,0), |p| {
-        (p.len(), p.values().filter(|v| v.get("passed").and_then(Value::as_bool) == Some(true)).count())
-    });
-    let proof_state = match selected.and_then(|s| s.get("passed")).and_then(Value::as_bool) {
-        Some(true) => "recorded_pass",
-        Some(false) => "recorded_failure",
-        None => "not_attached",
-    };
-    let road = value.get("roadDiff").unwrap_or(&Value::Null);
-    Some(json!({
-        "regionA":field(value,"/regionA"),
-        "regionB":field(value,"/regionB"),
-        "generatedAtEpochMs":safe_number(value,"/generatedAtEpochMs"),
-        "graphA": {
-            "regionId":field(value,"/graphA/regionId"),
-            "packageVersion":field(value,"/graphA/packageVersion"),
-            "graphFingerprint":fingerprint(value,"/graphA/graphFingerprint")
-        },
-        "graphB": {
-            "regionId":field(value,"/graphB/regionId"),
-            "packageVersion":field(value,"/graphB/packageVersion"),
-            "graphFingerprint":fingerprint(value,"/graphB/graphFingerprint")
-        },
-        "selectedCrossing": {
-            "status":proof_state,
-            "probeCount":probe_count,
-            "passedProbes":passed_probes,
-            "replayed":false
-        },
-        "roadDiff":{
-            "commonWays":safe_number(road,"/commonWays"),
-            "aOnlyWays":safe_number(road,"/aOnlyWays"),
-            "bOnlyWays":safe_number(road,"/bOnlyWays"),
-            "loadedEdgesA":safe_number(road,"/loadedEdgesA"),
-            "loadedEdgesB":safe_number(road,"/loadedEdgesB")
-        }
-    }))
-}
-
-fn border_reports(workspace: &Path, warnings: &mut Vec<&'static str>) -> Value {
-    let mut reports: Vec<_> = files(&workspace.join("reports"), ".json", warnings)
-        .into_iter()
-        .filter_map(|path| read_json(&path, warnings))
-        .filter_map(|v| report_summary(&v))
-        .collect();
-    reports.sort_by(|a,b| b["generatedAtEpochMs"].as_u64().cmp(&a["generatedAtEpochMs"].as_u64()));
-    let scanned = reports.len();
-    reports.truncate(MAX_REPORTS);
-    json!({
-        "count":reports.len(),
-        "truncated":scanned > MAX_REPORTS,
-        "items":reports,
-        "note":"Summaries of existing exported reports only. They may refer to stale graph builds; no Valhalla probe was run."
-    })
-}
-
 fn approved_stage(stage: &str) -> &'static str {
     match stage {
         "Starting build queue" => "starting",
@@ -404,11 +341,9 @@ pub fn diagnose(workspace: &Path, runtime_status: Option<Value>) -> Result<Value
         },
         "lastRecordedBuild":last_build(workspace,&mut warnings),
         "routingValidation":routing_validation(workspace,&mut warnings),
-        "borderReports":border_reports(workspace,&mut warnings),
         "warnings":warnings,
         "limitations":[
             "A historical successful manifest is not a freshly rerun Valhalla proof.",
-            "A border report is a prior export and may be stale for current graph fingerprints.",
             "Only builds completed after M2 record sanitized outcome metadata; raw historical failures cannot be reconstructed.",
             "No new Valhalla routes, integrity hashes, disk writes, builds, publication or destructive actions."
         ]
@@ -459,18 +394,6 @@ mod tests {
     }
 
     #[test]
-    fn exported_border_report_only_exposes_bounded_fields() {
-        let w=Workspace::new();
-        w.write("reports/a.json", r#"{"schema":"roadpilot.border-diagnostics","regionA":"austria","regionB":"oberbayern","generatedAtEpochMs":100,"selectedValidation":{"passed":false,"probes":{"one":{"passed":true,"error":"PRIVATE_SECRET"},"two":{"passed":false,"error":"PRIVATE_SECRET"}}},"roadDiff":{"commonWays":8,"aOnlyWays":2},"handoffs":{"notableHandoffs":[{"private":"PRIVATE_SECRET"}]}}"#);
-        let v=diagnose(&w.0,None).unwrap();
-        assert_eq!(v["borderReports"]["count"],1);
-        assert_eq!(v["borderReports"]["items"][0]["selectedCrossing"]["status"],"recorded_failure");
-        assert_eq!(v["borderReports"]["items"][0]["selectedCrossing"]["passedProbes"],1);
-        assert_eq!(v["borderReports"]["items"][0]["roadDiff"]["commonWays"],8);
-        assert!(!v.to_string().contains("PRIVATE_SECRET"));
-    }
-
-    #[test]
     fn sanitized_failure_outcome_never_persists_raw_error() {
         let w=Workspace::new();
         record_build_outcome(&w.0,Some("austria"),"test-v1","Clipping buffered regional source",
@@ -501,10 +424,9 @@ mod tests {
         use std::os::unix::fs::symlink;
         let w=Workspace::new();
         let outside=Workspace::new();
-        outside.write("private.json",r#"{"schema":"roadpilot.border-diagnostics","regionA":"private","secrets":"PRIVATE_SECRET"}"#);
-        symlink(&outside.0,w.0.join("reports")).unwrap();
+        outside.write("private/test-manifest.json",r#"{"schema":"roadpilot-routing-pack","regionId":"private","secrets":"PRIVATE_SECRET"}"#);
+        symlink(&outside.0,w.0.join("builds")).unwrap();
         let v=diagnose(&w.0,None).unwrap();
-        assert_eq!(v["borderReports"]["count"],0);
         assert!(!v.to_string().contains("PRIVATE_SECRET"));
     }
 }

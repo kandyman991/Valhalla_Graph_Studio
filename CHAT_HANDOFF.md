@@ -18,6 +18,5 @@ Phase 0 of `docs/ROADMAP.md`: pin the Valhalla version (3.6.3 in production), th
 
 ## Open owner decisions
 - Keep or drop the imported `visual/` and `search/` pipelines (RoadPilot data products, not graph tooling).
-- Whether to also remove `ai_diagnostics.rs` border-report summaries.
 - Relationship to `valhalla-graph-lab` (continue there for research, or treat this repository as its successor).
 - License.

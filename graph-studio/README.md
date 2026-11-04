@@ -48,6 +48,5 @@ Checks used when importing: `npx tsc --noEmit`, `npx vite build`, `cargo check` 
 
 ## Known leftovers to review
 
-- `src-tauri/src/ai_diagnostics.rs` still summarizes old border-report files if present (read-only; harmless without them).
 - The `visual/` and `search/` pipelines are RoadPilot data products, not graph tooling; decide later whether to keep them here.
 - `src/main.ts` (about 4,400 lines) and `src-tauri/src/lib.rs` (about 2,900 lines) are monoliths; split them before adding the ledger views.
