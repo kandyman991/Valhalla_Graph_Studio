@@ -13,7 +13,7 @@ Goals
 Non-goals
 - Replacing the Valhalla router or forking its costing logic.
 - A monolithic world build, or splitting one world build by tile (rejected, see `DECISIONS.md` D-002).
-- Changing the RoadPilot cross-region runtime (F8) in this repository.
+- Changing any client or runtime routing code in this repository.
 
 ## 2. Why separate builds do not connect
 
@@ -74,7 +74,7 @@ Tile growth from dead slots is bounded by periodic per-tile **compaction** (sect
 - Manifest: tile path -> content hash, size, revision, plus seam dependencies and the build-set identifier.
 - A device keeps a local manifest. An update downloads exactly the tiles whose hash differs, for **all** installed regions together and applied atomically (swap on success).
 - Adding a region brings the device to the current build set first.
-- Runtime check: before cross-region routing over a seam, verify that both sides are at compatible revisions. If not, fall back to the existing cross-region logic (F8) for that seam instead of routing over a mismatched pair.
+- Runtime check: before cross-region routing over a seam, verify that both sides are at compatible revisions. If not, do not route natively across that seam (the client falls back to its own handling) instead of routing over a mismatched pair.
 - Publication: immutable per-tile objects plus a small `latest` pointer written last (same pattern as the existing R2 publication, see `REUSE.md`).
 
 ## 8. Epochs, compaction, version bumps
@@ -89,7 +89,7 @@ Tile growth from dead slots is bounded by periodic per-tile **compaction** (sect
 2. **Byte identity:** tiles outside the dirty set are identical to the previous release.
 3. **Integrity checker:** every end node exists; opposing edges are symmetric; transitions are consistent; bins contain only live edges; no reference to a dead slot from a live entity.
 4. **Routing oracle:** a stock full build of the same data is the reference. Compare routes (cost, time, distance) on a large random sample, including cross-seam routes, in both directions and for each costing profile in use.
-5. **Cross-region parity with F8:** final acceptance evidence, compared on the same graph fingerprints.
+5. **Seam acceptance:** real cross-border routes across independently built regions succeed natively and match the oracle, in both directions.
 
 ## 10. Main risks
 

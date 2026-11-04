@@ -1,6 +1,6 @@
 # Valhalla Graph Studio (desktop app)
 
-Linux workstation (Tauri 2 + TypeScript + MapLibre) for building, validating, inspecting, comparing and publishing Valhalla routing graphs. Imported from RoadPilot Graph Studio (`RoadPilot-Offline-Data`, commit `f29efad`) and stripped of its F8 cross-region and border/handoff features. See [`../docs/IMPORT_PROVENANCE.md`](../docs/IMPORT_PROVENANCE.md).
+Linux workstation (Tauri 2 + TypeScript + MapLibre) for building, validating, inspecting, comparing and publishing Valhalla routing graphs. Imported from RoadPilot Graph Studio (`RoadPilot-Offline-Data`, commit `f29efad`) with its cross-region and border-inspection features removed. See [`../docs/IMPORT_PROVENANCE.md`](../docs/IMPORT_PROVENANCE.md).
 
 It is the future home of the ID-stable builder tooling (identity ledger, dirty-set and tile-diff views). Those parts do not exist yet; see [`../docs/ROADMAP.md`](../docs/ROADMAP.md).
 
@@ -15,7 +15,7 @@ It is the future home of the ID-stable builder tooling (identity ledger, dirty-s
 - Visual-map (PMTiles) and Search/POI (SQLite) inspectors and builds, kept from the original app.
 - Read-only headless inspection CLI (`--ai-capabilities`, `--ai-inspect`, `--ai-diagnose`, `--ai-verify-route`), see [`docs/AI_CONTROL.md`](docs/AI_CONTROL.md).
 
-Removed: Native F8 connectivity panel, Border inspector (manual handoffs, handoff artifacts, connector matrix, border diagnostics export) and the Graph A/B border overlays.
+Removed: the cross-region connectivity panel, the border inspector (manual handoffs, artifacts, connector matrix, diagnostics export) and the Graph A/B overlays.
 
 ## Local workspace
 

@@ -26,10 +26,10 @@ Distribute per-tile content hashes; devices fetch only changed tiles, applied at
 **Status:** Proposed (inherited from valhalla-graph-lab D-003).
 A conventional full Valhalla build of the same data is the routing oracle.
 
-## D-007 - Separate repository, no production effect yet
+## D-007 - Separate, independent repository
 **Status:** Accepted by owner (2026-11-04), by creating this repository.
-This project does not change `RoadPilot-Offline-Data` or the RoadPilot app. Integration needs the approval described in `CONTRACT_INTERACTION.md`.
+This project does not change `RoadPilot-Offline-Data` or the RoadPilot app.
 
-## D-008 - Import the Graph Studio app and build tooling, drop the F8 cross-region architecture
-**Status:** Accepted by owner (2026-11-04): "forget the old architecture"; bring in the UI and anything else worth using.
-Imported the app, pipeline and generic tests from RoadPilot-Offline-Data (`IMPORT_PROVENANCE.md`); left out F8, connectivity, crossing, handoff and connector-matrix code and documents. The earlier note in `CONTRACT_INTERACTION.md` still applies to any change in the RoadPilot repositories themselves.
+## D-008 - Start fresh: import the app and build tooling, leave the previous cross-region design behind
+**Status:** Accepted by owner (2026-11-04).
+Imported the Graph Studio app, pipeline and generic tests from RoadPilot-Offline-Data (`IMPORT_PROVENANCE.md`) without the previous cross-region, handoff and connector-matrix code, documents and decision records. This repository starts with its own decision log.

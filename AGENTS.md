@@ -10,7 +10,7 @@
 - Distinguish planned, implemented, tested and proven. Documentation is not evidence.
 - One variable per experiment; record inputs, versions and SHA-256 hashes. Reproducible scripts, no hidden manual steps.
 - Stock Valhalla is the routing reference. Validate rewritten graphs against a stock full build.
-- This project has no production effect. Do not edit `RoadPilot-Offline-Data` or the Android app from here. Production use needs the approval in `docs/CONTRACT_INTERACTION.md`.
+- This repository is independent. Do not edit `RoadPilot-Offline-Data` or the Android app from here.
 - Heavy builds run locally, not in cloud CI. Use `[skip ci]` for documentation-only commits.
 - Never commit credentials, private paths, signing keys, OSM extracts, graph tiles or the identity ledger (see `.gitignore`).
 

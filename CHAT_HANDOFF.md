@@ -11,7 +11,6 @@ Design and tooling for an ID-stable Valhalla graph builder (identity ledger + ti
 ## Current state
 - Design docs plus an imported desktop app and build pipeline (see `docs/IMPORT_PROVENANCE.md`). No ledger / rewriter code, no experiments run, no Valhalla source reviewed yet. The imported app compiles and type-checks but was never launched here.
 - Direction chosen by the owner (2026-11-04): region-by-region builds with persistent IDs; IDs change only where a road really changed; when a change affects two tiles, rebuild both and allocate new IDs only for what is new. A single world build and tile-splitting of one were rejected because users would have to re-download stored maps.
-- The direction conflicts with RoadPilot contract clauses (see `docs/CONTRACT_INTERACTION.md`). No production effect.
 
 ## Next exact action
 Phase 0 of `docs/ROADMAP.md`: pin the Valhalla version (3.6.3 in production), then read its source and answer `docs/OPEN_QUESTIONS.md` Q1-Q13, starting with Q2, Q3 and Q4 (they decide whether the dead-slot approach is possible at all). Then Phase 1 (determinism) on Andorra.

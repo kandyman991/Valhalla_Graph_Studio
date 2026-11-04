@@ -18,8 +18,7 @@ Preferred method: copy and adapt small, self-contained files (keeping a note of 
 | `tools/validate_routing_pack.py` | 103 lines | listed | Extract checks, smoke routes, size and hash checks | Starting point for the validator |
 | `tools/prepare_routing_publication.py`, `publish_routing_pack_r2.py`, `r2_publication_backend.py`, `docs/r2-publication.md` | - | listed | Immutable versioned objects plus `latest.json` pointer written last | Pattern for tile-level publication (Phase 7) |
 | `config/regions/*.json`, `schemas/` | - | listed | Region configuration format (polygon, buffer km, Valhalla version) | Reuse the format for region definitions |
-| `tools/audit_f8_graph_edge_parity.py`, `docs/F8_NATIVE_PARITY_AUDIT.md` | - | listed | Parity comparison against the F8 reference | Final acceptance evidence (Phase 8) |
-| `graph-studio/` (Tauri app) | 5.7k TS + 4.5k Rust | read (structure, commands) | Desktop UI shell | **Imported** (F8 / border features removed, renamed). Later: ledger and dirty-set views |
+| `graph-studio/` (Tauri app) | 5.7k TS + 4.5k Rust | read (structure, commands) | Desktop UI shell | **Imported** (cross-region / border features removed, renamed). Later: ledger and dirty-set views |
 | `AGENTS.md`, `docs/ARCHITECTURE_MEMORY.md`, `docs/FAILED_APPROACHES.md` | - | read | Continuity and failure-history process | Already adapted in this repository |
 
 Not reused: the retired OSM-based crossing discovery and connector-matrix code (retired there by decision D-014).
@@ -41,6 +40,5 @@ Only a README, license (Apache-2.0) and process documents exist. Nothing to reus
 `SmartRide-Next` (Android app, private): the consumer side of the update protocol. Review when Phase 7 starts.
 
 ## Other candidates found during the UI import (not imported)
-- `tools/audit_f8_graph_edge_parity.py`, `tools/probe_native_f8_*.py`, `docs/F8_*.md`: F8 parity and journey probes. Not needed by the new design; revisit only for the final cross-region acceptance comparison.
 - `docs/ENGINEERING_DECISIONS.md`, `docs/CONTINUITY_PLAYBOOK.md`: process documents; the relevant parts were adapted into `AGENTS.md`.
 - `.github/workflows` for AppImage / deb packaging of the app: not reviewed yet; needed when this repository should build releases.

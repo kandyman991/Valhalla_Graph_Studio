@@ -6,12 +6,12 @@ Date: 2026-11-04. Source: `kandyman991/RoadPilot-Offline-Data`, commit `f29efad`
 `config/`, `schemas/`, `visual/`, `search/`, `requirements-*.txt`, and `tools/*.py` except the groups below.
 
 ## Copied and modified
-- `graph-studio/` (Tauri app). Removed the Native F8 connectivity panel, the Border inspector and the Graph A/B overlays: about 1,300 lines of `src/main.ts`, 1,600 lines of `src-tauri/src/lib.rs`, 180 lines of CSS, 26 Tauri commands. Renamed the app (package, crate, bundle identifier, product name) and the workspace directory to `~/ValhallaGraphStudio` so it can coexist with the RoadPilot app.
+- `graph-studio/` (Tauri app). Removed the cross-region connectivity panel, the border inspector and the Graph A/B overlays: about 1,300 lines of `src/main.ts`, 1,600 lines of `src-tauri/src/lib.rs`, 180 lines of CSS, 26 Tauri commands. Renamed the app (package, crate, bundle identifier, product name) and the workspace directory to `~/ValhallaGraphStudio` so it can coexist with the RoadPilot app.
 - `ai_diagnostics.rs`: removed the border-report summaries (`borderReports`) and their test; Rust unit tests: 17 passed.
-- `tests/`: kept the 8 generic tests, dropped the three that assert the old UI source text (they require the F8 and border panels).
+- `tests/`: kept the 8 generic tests, dropped the three that assert the old UI source text (they require the removed panels).
 
 ## Not imported (old architecture)
-`tools/` files matching `*f8*`, `*connectiv*`, `*connector*`, `*frontier*`, `*crossing*`, `*handoff*` (29 files), `tools/legacy_archive/`, the F8 and retired-architecture documents, and the F8 / historical-fixture tests and fixtures.
+`tools/` files matching `*f8*`, `*connectiv*`, `*connector*`, `*frontier*`, `*crossing*`, `*handoff*` (29 files), `tools/legacy_archive/`, the contract, F8 and retired-design documents, and the related tests and fixtures.
 
 Also dropped after a second pass: `schemas/legacy_archive/` and `schemas/cross-region-connectivity.schema.json`, `tools/check_architecture_contract.py`, and the `CONNECTIVITY` / `CONNECTOR_*` publication kinds from the two publication schemas.
 
