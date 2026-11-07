@@ -1,0 +1,2947 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    thread,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use tauri::{AppHandle, Emitter, Manager, State};
+#[cfg(unix)]
+
+pub mod ai_control;
+pub mod ai_diagnostics;
+pub mod ai_verify;
+
+#[derive(Debug, Clone, Serialize)]
+struct Coverage {
+    min_lat: f64,
+    max_lat: f64,
+    min_lng: f64,
+    max_lng: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RegionSummary {
+    id: String,
+    name: String,
+    border_buffer_km: f64,
+    expected_valhalla_version: String,
+    primary_geofabrik_id: Option<String>,
+    source_ids: Vec<String>,
+    coverage: Option<Coverage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ToolStatus {
+    name: String,
+    available: bool,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ToolchainStatus {
+    ready: bool,
+    tools: Vec<ToolStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SystemStats {
+    logical_cpus: usize,
+    load_1m: f64,
+    memory_used_bytes: u64,
+    memory_total_bytes: u64,
+    disk_free_bytes: Option<u64>,
+    temperature_c: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BuildStatus {
+    running: bool,
+    current_region: Option<String>,
+    queue: Vec<String>,
+    stage: String,
+    started_at_epoch_ms: Option<u128>,
+    last_error: Option<String>,
+}
+
+impl Default for BuildStatus {
+    fn default() -> Self {
+        Self {
+            running: false,
+            current_region: None,
+            queue: Vec::new(),
+            stage: "Idle".into(),
+            started_at_epoch_ms: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BuildArtifact {
+    region_id: String,
+    version: String,
+    built_at_utc: String,
+    artifact_file: String,
+    size_bytes: u64,
+    sha256: String,
+    tile_count: u64,
+    manifest_path: String,
+    graph_index_path: Option<String>,
+    graph_tile_fingerprint: Option<String>,
+    internal_fingerprint: Option<String>,
+    boundary_fingerprints: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VisualBuildArtifact {
+    region_id: String,
+    version: String,
+    built_at_utc: String,
+    artifact_file: String,
+    size_bytes: u64,
+    sha256: String,
+    tile_count: u64,
+    min_zoom: u64,
+    max_zoom: u64,
+    bounds: Value,
+    source_fingerprint: String,
+    profile_fingerprint: String,
+    manifest_path: String,
+    layers: Vec<String>,
+    road_index_file: Option<String>,
+    major_road_count: u64,
+    border_road_count: u64,
+    missing_road_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BuildLog {
+    line: String,
+}
+
+#[derive(Clone)]
+struct BuildState {
+    status: Arc<Mutex<BuildStatus>>,
+    cancel: Arc<AtomicBool>,
+    current_pid: Arc<Mutex<Option<u32>>>,
+    failure_hint: Arc<Mutex<Option<&'static str>>>,
+}
+
+impl Default for BuildState {
+    fn default() -> Self {
+        Self {
+            status: Arc::new(Mutex::new(BuildStatus::default())),
+            cancel: Arc::new(AtomicBool::new(false)),
+            current_pid: Arc::new(Mutex::new(None)),
+            failure_hint: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct R2CredentialFile {
+    account_id: String,
+    bucket: String,
+    access_key_id: String,
+    secret_access_key: String,
+    endpoint_url: Option<String>,
+}
+
+
+#[derive(Debug, Clone, Serialize)]
+struct SearchBuildArtifact {
+    region_id: String,
+    version: String,
+    built_at_utc: String,
+    database_file: String,
+    database_path: String,
+    size_bytes: u64,
+    sha256: String,
+    record_count: u64,
+    categorized_record_count: u64,
+    source_release: String,
+    source_fingerprint: String,
+    search_fingerprint: String,
+    manifest_path: String,
+    validation_passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct R2CredentialStatus {
+    configured: bool,
+    account_id: Option<String>,
+    bucket: Option<String>,
+    access_key_suffix: Option<String>,
+    endpoint_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicationStatus {
+    running: bool,
+    region_id: Option<String>,
+    package_version: Option<String>,
+    stage: String,
+    current_key: Option<String>,
+    bytes_transferred: u64,
+    total_bytes: u64,
+    last_error: Option<String>,
+}
+
+impl Default for PublicationStatus {
+    fn default() -> Self {
+        Self {
+            running: false,
+            region_id: None,
+            package_version: None,
+            stage: "Publication idle".into(),
+            current_key: None,
+            bytes_transferred: 0,
+            total_bytes: 0,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PublicationState {
+    status: Arc<Mutex<PublicationStatus>>,
+}
+
+impl Default for PublicationState {
+    fn default() -> Self {
+        Self {
+            status: Arc::new(Mutex::new(PublicationStatus::default())),
+        }
+    }
+}
+
+fn emit_publication_status(app: &AppHandle, state: &PublicationState) {
+    let snapshot = state
+        .status
+        .lock()
+        .expect("publication status poisoned")
+        .clone();
+    let _ = app.emit("graph-studio://publication-status", snapshot);
+}
+
+fn emit_publication_event(app: &AppHandle, event: &Value) {
+    let _ = app.emit("graph-studio://publication-event", event.clone());
+}
+
+fn now_epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn safe_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn emit_log(app: &AppHandle, line: impl Into<String>) {
+    let _ = app.emit(
+        "graph-studio://build-log",
+        BuildLog { line: line.into() },
+    );
+}
+
+fn emit_status(app: &AppHandle, state: &BuildState) {
+    let snapshot = state.status.lock().expect("build status poisoned").clone();
+    let _ = app.emit("graph-studio://build-status", snapshot);
+}
+
+fn set_stage(app: &AppHandle, state: &BuildState, stage: impl Into<String>) {
+    state.status.lock().expect("build status poisoned").stage = stage.into();
+    emit_status(app, state);
+}
+
+// JSON route/locate/expansion commands must use the same launcher as the
+// successful M3 headless command. GUI's process PATH is rewritten to prefer
+// native tile tools: that must not change which executable handles routes.
+static ROUTE_SERVICE_LAUNCHER: OnceLock<PathBuf> = OnceLock::new();
+fn route_service_executable() -> PathBuf {
+    ROUTE_SERVICE_LAUNCHER.get().cloned()
+        .unwrap_or_else(|| PathBuf::from("valhalla_service"))
+}
+
+fn pyvalhalla_native_bin_dir() -> Option<PathBuf> {
+    let launcher = executable_path("valhalla_service")?;
+    let output = Command::new(&launcher).arg("--version").output().ok()?;
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    for line in text.lines() {
+        let Some(start) = line.find("[INFO] Running ") else {
+            continue;
+        };
+        let rest = &line[start + "[INFO] Running ".len()..];
+        let Some(end) = rest.find(" with args:") else {
+            continue;
+        };
+        let native = PathBuf::from(&rest[..end]);
+        if native.file_name().and_then(|name| name.to_str()) != Some("valhalla_service")
+            || !native.is_file()
+        {
+            continue;
+        }
+        let dir = native.parent()?.to_path_buf();
+        if dir.join("valhalla_build_tiles").is_file()
+            && dir.join("valhalla_build_admins").is_file()
+        {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+fn normalize_process_path() {
+    let home = env::var("HOME").unwrap_or_default();
+    let current = env::var_os("PATH").unwrap_or_default();
+    let mut paths: Vec<PathBuf> = env::split_paths(&current).collect();
+    for candidate in [
+        "/usr/local/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/bin".to_string(),
+        format!("{home}/.local/bin"),
+        format!("{home}/.cargo/bin"),
+    ] {
+        let p = PathBuf::from(candidate);
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    if let Ok(joined) = env::join_paths(&paths) {
+        env::set_var("PATH", joined);
+    }
+
+    // pyvalhalla console entry points print an informational launcher line to stdout.
+    // That corrupts JSON responses and binary graph-tile output from valhalla_service.
+    // Prefer the wheel's real native Valhalla binaries whenever we can discover them.
+    if let Some(native_bin) = pyvalhalla_native_bin_dir() {
+        // Capture the known-working pyvalhalla launcher BEFORE prepending
+        // native Valhalla tools to PATH for binary tile rendering.
+        if let Some(launcher) = executable_path("valhalla_service") {
+            let _ = ROUTE_SERVICE_LAUNCHER.set(launcher);
+        }
+        paths.retain(|path| path != &native_bin);
+        paths.insert(0, native_bin);
+        if let Ok(joined) = env::join_paths(paths) {
+            env::set_var("PATH", joined);
+        }
+    }
+}
+
+fn executable_path(name: &str) -> Option<PathBuf> {
+    env::var_os("PATH").and_then(|path| {
+        env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+fn pipeline_root(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Ok(override_path) = env::var("ROADPILOT_PIPELINE_ROOT") {
+        let path = PathBuf::from(override_path);
+        if path.join("config/regions").is_dir() && path.join("tools").is_dir() {
+            return Ok(path);
+        }
+    }
+
+    let bundled = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("Could not resolve Graph Studio resources: {e}"))?
+        .join("pipeline");
+    if bundled.join("config/regions").is_dir() {
+        return Ok(bundled);
+    }
+
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve development pipeline root: {e}"))?;
+    if dev.join("config/regions").is_dir() {
+        return Ok(dev);
+    }
+
+    Err("RoadPilot offline-data pipeline resources were not found.".into())
+}
+
+fn workspace_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let root = app
+        .path()
+        .home_dir()
+        .map_err(|e| format!("Could not resolve home directory: {e}"))?
+        .join("ValhallaGraphStudio");
+    fs::create_dir_all(&root).map_err(|e| format!("Could not create workspace: {e}"))?;
+    Ok(root)
+}
+
+fn r2_credentials_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Could not resolve Graph Studio app-data directory: {e}"))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("Could not create Graph Studio app-data directory: {e}"))?;
+    Ok(dir.join("r2-credentials.json"))
+}
+
+fn validate_r2_credentials(value: &R2CredentialFile) -> Result<(), String> {
+    if value.account_id.trim().is_empty() || !safe_token(value.account_id.trim()) {
+        return Err("Cloudflare account ID is invalid.".into());
+    }
+    if value.bucket.trim().is_empty() || !safe_token(value.bucket.trim()) {
+        return Err("R2 bucket name is invalid.".into());
+    }
+    if value.access_key_id.trim().is_empty() {
+        return Err("R2 access key ID is required.".into());
+    }
+    if value.secret_access_key.trim().is_empty() {
+        return Err("R2 secret access key is required.".into());
+    }
+    if let Some(endpoint) = value.endpoint_url.as_deref() {
+        if !endpoint.is_empty() && !endpoint.starts_with("https://") {
+            return Err("Custom R2 endpoint must use https://.".into());
+        }
+    }
+    Ok(())
+}
+
+fn read_r2_credentials(app: &AppHandle) -> Result<R2CredentialFile, String> {
+    let path = r2_credentials_path(app)?;
+    let text = fs::read_to_string(&path)
+        .map_err(|_| "R2 credentials are not configured in Graph Studio.".to_string())?;
+    let value: R2CredentialFile = serde_json::from_str(&text)
+        .map_err(|e| format!("Could not parse local R2 credentials: {e}"))?;
+    validate_r2_credentials(&value)?;
+    Ok(value)
+}
+
+fn write_r2_credentials(app: &AppHandle, value: &R2CredentialFile) -> Result<(), String> {
+    validate_r2_credentials(value)?;
+    let path = r2_credentials_path(app)?;
+    let body = serde_json::to_vec_pretty(value)
+        .map_err(|e| format!("Could not serialize R2 credentials: {e}"))?;
+
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|e| format!("Could not open local R2 credential file: {e}"))?;
+    file.write_all(&body)
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|e| format!("Could not write local R2 credentials: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("Could not sync local R2 credentials: {e}"))?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Could not protect local R2 credential file: {e}"))?;
+    }
+    Ok(())
+}
+
+fn r2_credential_status_for(app: &AppHandle) -> Result<R2CredentialStatus, String> {
+    let path = r2_credentials_path(app)?;
+    if !path.is_file() {
+        return Ok(R2CredentialStatus {
+            configured: false,
+            account_id: None,
+            bucket: None,
+            access_key_suffix: None,
+            endpoint_url: None,
+        });
+    }
+    let value = read_r2_credentials(app)?;
+    let suffix: String = value
+        .access_key_id
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    Ok(R2CredentialStatus {
+        configured: true,
+        account_id: Some(value.account_id),
+        bucket: Some(value.bucket),
+        access_key_suffix: Some(suffix),
+        endpoint_url: value.endpoint_url.filter(|value| !value.is_empty()),
+    })
+}
+
+fn apply_r2_env(command: &mut Command, credentials: &R2CredentialFile) {
+    command
+        .env("CLOUDFLARE_ACCOUNT_ID", &credentials.account_id)
+        .env("R2_ACCESS_KEY_ID", &credentials.access_key_id)
+        .env("R2_SECRET_ACCESS_KEY", &credentials.secret_access_key)
+        .env("R2_BUCKET", &credentials.bucket);
+    if let Some(endpoint) = credentials.endpoint_url.as_deref().filter(|value| !value.is_empty()) {
+        command.env("R2_ENDPOINT_URL", endpoint);
+    } else {
+        command.env_remove("R2_ENDPOINT_URL");
+    }
+}
+
+fn publication_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = workspace_root(app)?.join("publication");
+    fs::create_dir_all(&path)
+        .map_err(|e| format!("Could not create publication workspace: {e}"))?;
+    Ok(path)
+}
+
+fn region_config_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let destination = workspace_root(app)?.join("config/regions");
+    fs::create_dir_all(&destination)
+        .map_err(|e| format!("Could not create writable region config directory: {e}"))?;
+
+    let bundled = pipeline_root(app)?.join("config/regions");
+    if bundled.is_dir() {
+        for entry in fs::read_dir(&bundled)
+            .map_err(|e| format!("Could not read bundled region configs: {e}"))?
+            .flatten()
+        {
+            let source = entry.path();
+            if source.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(file_name) = source.file_name() else {
+                continue;
+            };
+            let target = destination.join(file_name);
+            if !target.exists() {
+                fs::copy(&source, &target).map_err(|e| {
+                    format!(
+                        "Could not seed writable region config {}: {e}",
+                        target.display()
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(destination)
+}
+
+fn geofabrik_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = workspace_root(app)?.join("catalog");
+    fs::create_dir_all(&path)
+        .map_err(|e| format!("Could not create Geofabrik catalog cache: {e}"))?;
+    Ok(path)
+}
+
+fn work_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = workspace_root(app)?.join("work");
+    fs::create_dir_all(&path).map_err(|e| format!("Could not create work directory: {e}"))?;
+    Ok(path)
+}
+
+fn dist_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = workspace_root(app)?.join("builds");
+    fs::create_dir_all(&path).map_err(|e| format!("Could not create build directory: {e}"))?;
+    Ok(path)
+}
+
+fn visual_dist_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = workspace_root(app)?.join("visual-builds");
+    fs::create_dir_all(&path)
+        .map_err(|e| format!("Could not create visual build directory: {e}"))?;
+    Ok(path)
+}
+
+fn search_build_roots(app: &AppHandle) -> Result<Vec<PathBuf>, String> {
+    let mut roots = vec![workspace_root(app)?.join("search-builds")];
+    if let Ok(pipeline) = pipeline_root(app) {
+        roots.push(pipeline.join("dist/search"));
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn safe_search_component(value: &str, label: &str) -> Result<(), String> {
+    if value.trim().is_empty() || value == "." || value == ".." || value.contains('/') || value.contains('\\') || value.contains("..") {
+        return Err(format!("Unsafe {label}: {value:?}"));
+    }
+    Ok(())
+}
+
+fn load_search_build(app: &AppHandle, region_id: &str, version: &str) -> Result<(SearchBuildArtifact, PathBuf), String> {
+    safe_search_component(region_id, "region id")?;
+    safe_search_component(version, "search version")?;
+    for root in search_build_roots(app)? {
+        let dir = root.join(region_id).join(version);
+        if !dir.is_dir() { continue; }
+        let Ok(entries) = fs::read_dir(&dir) else { continue; };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().and_then(|v| v.to_str()) != Some("json") { continue; }
+            let Ok(text) = fs::read_to_string(&path) else { continue; };
+            let Ok(doc) = serde_json::from_str::<Value>(&text) else { continue; };
+            if doc.get("schema").and_then(Value::as_str) != Some("roadpilot-search-pack") { continue; }
+            if doc.get("regionId").and_then(Value::as_str) != Some(region_id) || doc.get("packVersion").and_then(Value::as_str) != Some(version) { continue; }
+            let file_name = doc.get("fileName").and_then(Value::as_str).ok_or("Search manifest missing fileName.")?;
+            let db = dir.join(file_name);
+            if !db.is_file() { return Err(format!("Search database missing: {}", db.display())); }
+            let enrichment = doc.get("enrichment").cloned().unwrap_or(Value::Null);
+            let source = doc.get("source").cloned().unwrap_or(Value::Null);
+            let artifact = SearchBuildArtifact {
+                region_id: region_id.to_string(),
+                version: version.to_string(),
+                built_at_utc: doc.get("builtAtUtc").and_then(Value::as_str).unwrap_or_default().to_string(),
+                database_file: file_name.to_string(),
+                database_path: db.display().to_string(),
+                size_bytes: doc.get("sizeBytes").and_then(Value::as_u64).unwrap_or_else(|| fs::metadata(&db).map(|m| m.len()).unwrap_or(0)),
+                sha256: doc.get("sha256").and_then(Value::as_str).unwrap_or_default().to_string(),
+                record_count: doc.get("recordCount").and_then(Value::as_u64).unwrap_or(0),
+                categorized_record_count: enrichment.get("categorizedRecordCount").and_then(Value::as_u64).unwrap_or(0),
+                source_release: source.get("dataRelease").and_then(Value::as_str).unwrap_or_default().to_string(),
+                source_fingerprint: doc.get("sourceFingerprint").and_then(Value::as_str).unwrap_or_default().to_string(),
+                search_fingerprint: doc.get("searchFingerprint").and_then(Value::as_str).unwrap_or_default().to_string(),
+                manifest_path: path.display().to_string(),
+                validation_passed: doc.pointer("/validation/passed").and_then(Value::as_bool) == Some(true),
+            };
+            return Ok((artifact, db));
+        }
+    }
+    Err(format!("Retained search build not found: {region_id} {version}"))
+}
+
+fn python_env_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("Could not resolve app cache: {e}"))?
+        .join("python-env");
+    fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))
+        .map_err(|e| format!("Could not create app cache: {e}"))?;
+    Ok(path)
+}
+
+fn ensure_python_env(app: &AppHandle) -> Result<PathBuf, String> {
+    let env_dir = python_env_dir(app)?;
+    let python = env_dir.join("bin/python");
+    let pipeline = pipeline_root(app)?;
+    let routing_requirements = pipeline.join("requirements-routing.txt");
+    let visual_requirements = pipeline.join("requirements-visual.txt");
+    let search_requirements = pipeline.join("requirements-search.txt");
+
+    if !python.is_file() {
+        emit_log(app, "Preparing Graph Studio Python environment…");
+        let status = Command::new("python3")
+            .args(["-m", "venv"])
+            .arg(&env_dir)
+            .status()
+            .map_err(|e| format!("Could not create Python virtual environment: {e}"))?;
+        if !status.success() {
+            return Err(
+                "python3 -m venv failed. Install the python3-venv package and retry.".into(),
+            );
+        }
+    }
+
+    let marker = env_dir.join(".roadpilot-requirements-ready");
+    let requirements_stamp = [&routing_requirements, &visual_requirements, &search_requirements]
+        .iter()
+        .map(|path| {
+            fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(":");
+    let marker_value = fs::read_to_string(&marker).unwrap_or_default();
+
+    if marker_value.trim() != requirements_stamp {
+        emit_log(app, "Installing/updating Graph Studio Python dependencies…");
+        let status = Command::new(&python)
+            .args(["-m", "pip", "install", "--upgrade", "pip"])
+            .status()
+            .map_err(|e| format!("Could not update pip: {e}"))?;
+        if !status.success() {
+            return Err("pip upgrade failed.".into());
+        }
+
+        for requirements in [&routing_requirements, &visual_requirements, &search_requirements] {
+            let status = Command::new(&python)
+                .args(["-m", "pip", "install", "-r"])
+                .arg(requirements)
+                .status()
+                .map_err(|e| format!("Could not install Python requirements: {e}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "Installing Graph Studio Python requirements failed: {}",
+                    requirements.display()
+                ));
+            }
+        }
+        fs::write(&marker, &requirements_stamp)
+            .map_err(|e| format!("Could not write Python environment marker: {e}"))?;
+    }
+
+    Ok(python)
+}
+
+#[tauri::command]
+fn list_regions(app: AppHandle) -> Result<Vec<RegionSummary>, String> {
+    let root = region_config_dir(&app)?;
+    let mut entries: Vec<PathBuf> = fs::read_dir(root)
+        .map_err(|e| format!("Could not read region configs: {e}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    entries.sort();
+
+    let mut regions = Vec::new();
+    for path in entries {
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|e| format!("Could not parse {}: {e}", path.display()))?;
+        let Some(routing) = value.get("routing") else {
+            continue;
+        };
+        if routing.get("enabled").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+
+        let source_ids = routing
+            .pointer("/source/pbfs")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let coverage = value
+            .pointer("/routing/coverage")
+            .or_else(|| value.pointer("/overture/coverage"))
+            .and_then(|c| {
+            Some(Coverage {
+                min_lat: c.get("minLat")?.as_f64()?,
+                max_lat: c.get("maxLat")?.as_f64()?,
+                min_lng: c.get("minLng")?.as_f64()?,
+                max_lng: c.get("maxLng")?.as_f64()?,
+            })
+        });
+
+        regions.push(RegionSummary {
+            id: value.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
+            name: value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Unnamed region")
+                .to_string(),
+            border_buffer_km: routing
+                .get("borderBufferKm")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0),
+            expected_valhalla_version: routing
+                .get("expectedValhallaVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            primary_geofabrik_id: routing
+                .pointer("/source/primaryGeofabrikId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            source_ids,
+            coverage,
+        });
+    }
+    Ok(regions)
+}
+
+fn run_graph_studio_region_helper(
+    app: &AppHandle,
+    arguments: &[String],
+) -> Result<Value, String> {
+    // Browsing the catalog must work on the first launch, even when the
+    // expensive build/geometry Python environment is not installed yet.
+    // graph_studio_regions.py imports optional geometry modules lazily.
+    let catalog_only = arguments.last().map(String::as_str) == Some("catalog");
+    let python = if catalog_only {
+        PathBuf::from("python3")
+    } else {
+        ensure_python_env(app)?
+    };
+    let pipeline = pipeline_root(app)?;
+    let script = pipeline.join("tools/graph_studio_regions.py");
+    if !script.is_file() {
+        return Err(format!(
+            "Graph Studio region helper is missing: {}",
+            script.display()
+        ));
+    }
+
+    let output = Command::new(python)
+        .arg(script)
+        .args(arguments)
+        .output()
+        .map_err(|e| format!("Could not run Graph Studio region helper: {e}"))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if error.is_empty() {
+            "Graph Studio region helper failed.".into()
+        } else {
+            error
+        });
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Region helper returned invalid JSON: {e}"))
+}
+
+#[tauri::command]
+fn geofabrik_catalog(app: AppHandle, refresh: bool) -> Result<Value, String> {
+    let cache = geofabrik_cache_dir(&app)?;
+    let mut args = vec![
+        "--cache-dir".to_string(),
+        cache.display().to_string(),
+    ];
+    if refresh {
+        args.push("--refresh".into());
+    }
+    args.push("catalog".into());
+    run_graph_studio_region_helper(&app, &args)
+}
+
+#[tauri::command]
+fn preview_region(
+    app: AppHandle,
+    geofabrik_id: String,
+    buffer_km: f64,
+    refresh: bool,
+) -> Result<Value, String> {
+    if geofabrik_id.is_empty() || geofabrik_id.len() > 160 {
+        return Err("Invalid Geofabrik region id.".into());
+    }
+    if !buffer_km.is_finite() || !(0.0..=100.0).contains(&buffer_km) || buffer_km == 0.0 {
+        return Err("Border buffer must be greater than 0 and no more than 100 km.".into());
+    }
+    let cache = geofabrik_cache_dir(&app)?;
+    let mut args = vec![
+        "--cache-dir".to_string(),
+        cache.display().to_string(),
+    ];
+    if refresh {
+        args.push("--refresh".into());
+    }
+    args.extend([
+        "preview".into(),
+        "--geofabrik-id".into(),
+        geofabrik_id,
+        "--buffer-km".into(),
+        buffer_km.to_string(),
+    ]);
+    run_graph_studio_region_helper(&app, &args)
+}
+
+#[tauri::command]
+fn load_region_config(app: AppHandle, region_id: String) -> Result<Value, String> {
+    if !safe_token(&region_id) {
+        return Err("Invalid RoadPilot region id.".into());
+    }
+    let path = region_config_dir(&app)?.join(format!("{region_id}.json"));
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("Could not parse {}: {e}", path.display()))
+}
+
+#[tauri::command]
+fn save_region_config(
+    app: AppHandle,
+    config: Value,
+    refresh_geometry: bool,
+) -> Result<Value, String> {
+    let region_id = config
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("Region config id is required.")?
+        .to_string();
+    if !safe_token(&region_id) {
+        return Err("RoadPilot region id contains unsupported characters.".into());
+    }
+
+    let root = region_config_dir(&app)?;
+    let destination = root.join(format!("{region_id}.json"));
+    let temporary = root.join(format!(".{region_id}.json.tmp"));
+    let serialized = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("Could not serialize region config: {e}"))?;
+    fs::write(&temporary, format!("{serialized}\n"))
+        .map_err(|e| format!("Could not write temporary region config: {e}"))?;
+
+    let validate_result = (|| -> Result<(), String> {
+        let python = ensure_python_env(&app)?;
+        let pipeline = pipeline_root(&app)?;
+        let structural = Command::new(&python)
+            .arg(pipeline.join("tools/validate_region_config.py"))
+            .arg("--config")
+            .arg(&temporary)
+            .output()
+            .map_err(|e| format!("Could not validate region config: {e}"))?;
+        if !structural.status.success() {
+            return Err(String::from_utf8_lossy(&structural.stderr).trim().to_string());
+        }
+
+        let cache = geofabrik_cache_dir(&app)?;
+        let mut args = vec![
+            "--cache-dir".to_string(),
+            cache.display().to_string(),
+        ];
+        if refresh_geometry {
+            args.push("--refresh".into());
+        }
+        args.extend([
+            "validate-config".into(),
+            "--config".into(),
+            temporary.display().to_string(),
+        ]);
+        run_graph_studio_region_helper(&app, &args)?;
+        Ok(())
+    })();
+
+    if let Err(error) = validate_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(if error.is_empty() {
+            "Region config validation failed.".into()
+        } else {
+            error
+        });
+    }
+
+    fs::rename(&temporary, &destination)
+        .map_err(|e| format!("Could not activate region config: {e}"))?;
+    Ok(config)
+}
+
+#[tauri::command]
+fn toolchain_status(app: AppHandle) -> ToolchainStatus {
+    let names = [
+        "python3",
+        "osmium",
+        "valhalla_build_config",
+        "valhalla_build_timezones",
+        "valhalla_build_admins",
+        "valhalla_build_tiles",
+        "valhalla_build_extract",
+        "valhalla_service",
+    ];
+    let mut tools = Vec::new();
+    for name in names {
+        let path = executable_path(name);
+        tools.push(ToolStatus {
+            name: name.to_string(),
+            available: path.is_some(),
+            detail: path
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "missing".into()),
+        });
+    }
+
+    let tilemaker_path = executable_path("tilemaker");
+    let expected_tilemaker = pipeline_root(&app)
+        .ok()
+        .and_then(|root| fs::read_to_string(root.join("visual/tilemaker/toolchain.json")).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.get("tilemakerVersion").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| "3.2.0".into());
+    let (tilemaker_ready, tilemaker_detail) = match tilemaker_path {
+        Some(path) => {
+            let output = Command::new(&path)
+                .arg("--help")
+                .output()
+                .ok()
+                .map(|output| {
+                    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+                    text.push_str(&String::from_utf8_lossy(&output.stderr));
+                    text
+                })
+                .unwrap_or_default();
+            let marker_a = format!("tilemaker {expected_tilemaker}");
+            let marker_b = format!("tilemaker v{expected_tilemaker}");
+            let matches = output.contains(&marker_a) || output.contains(&marker_b);
+            (
+                matches,
+                if matches {
+                    format!("{} • {}", path.display(), expected_tilemaker)
+                } else {
+                    format!("{} • expected {}, version mismatch", path.display(), expected_tilemaker)
+                },
+            )
+        }
+        None => (false, format!("missing • expected {expected_tilemaker}")),
+    };
+    tools.push(ToolStatus {
+        name: "tilemaker".into(),
+        available: tilemaker_ready,
+        detail: tilemaker_detail,
+    });
+
+    let venv_ready = Command::new("python3")
+        .args(["-m", "venv", "--help"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    tools.push(ToolStatus {
+        name: "python3-venv".into(),
+        available: venv_ready,
+        detail: if venv_ready { "ready".into() } else { "missing".into() },
+    });
+
+    ToolchainStatus {
+        ready: tools.iter().all(|tool| tool.available),
+        tools,
+    }
+}
+
+fn parse_meminfo() -> (u64, u64) {
+    let text = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let mut total_kb = 0_u64;
+    let mut available_kb = 0_u64;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("MemTotal:") => total_kb = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            Some("MemAvailable:") => {
+                available_kb = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+            }
+            _ => {}
+        }
+    }
+    let total = total_kb * 1024;
+    let available = available_kb * 1024;
+    (total.saturating_sub(available), total)
+}
+
+fn read_temperature() -> Option<f64> {
+    let mut values = Vec::new();
+    for root in ["/sys/class/thermal", "/sys/class/hwmon"] {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(children) = fs::read_dir(&path) else {
+                continue;
+            };
+            for child in children.flatten() {
+                let file = child.path();
+                let name = file.file_name()?.to_string_lossy();
+                if !(name == "temp" || (name.starts_with("temp") && name.ends_with("_input"))) {
+                    continue;
+                }
+                if let Ok(raw) = fs::read_to_string(&file) {
+                    if let Ok(value) = raw.trim().parse::<f64>() {
+                        let celsius = if value > 500.0 { value / 1000.0 } else { value };
+                        if (0.0..=130.0).contains(&celsius) {
+                            values.push(celsius);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    values.into_iter().reduce(f64::max)
+}
+
+fn disk_free(path: &Path) -> Option<u64> {
+    let output = Command::new("df")
+        .arg("-B1")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().nth(1)?;
+    line.split_whitespace().nth(3)?.parse().ok()
+}
+
+#[tauri::command]
+fn system_stats(app: AppHandle) -> Result<SystemStats, String> {
+    let logical_cpus = thread::available_parallelism().map(|v| v.get()).unwrap_or(1);
+    let load_1m = fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|v| v.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0.0);
+    let (memory_used_bytes, memory_total_bytes) = parse_meminfo();
+    let root = workspace_root(&app)?;
+
+    Ok(SystemStats {
+        logical_cpus,
+        load_1m,
+        memory_used_bytes,
+        memory_total_bytes,
+        disk_free_bytes: disk_free(&root),
+        temperature_c: read_temperature(),
+    })
+}
+
+#[tauri::command]
+fn build_status(state: State<'_, BuildState>) -> BuildStatus {
+    state.status.lock().expect("build status poisoned").clone()
+}
+
+fn stage_for_log(line: &str) -> Option<&'static str> {
+    if line.contains("download:") {
+        Some("Downloading Geofabrik sources")
+    } else if line.contains("osmium merge") {
+        Some("Merging regional OSM sources")
+    } else if line.contains("osmium extract") {
+        Some("Clipping buffered regional source")
+    } else if line.contains("osmium check-refs") {
+        Some("Checking OSM reference integrity")
+    } else if line.contains("valhalla_build_timezones") {
+        Some("Building timezone database")
+    } else if line.contains("valhalla_build_admins") {
+        Some("Building administrative database")
+    } else if line.contains("valhalla_build_tiles") {
+        Some("Building Valhalla graph tiles")
+    } else if line.contains("valhalla_build_extract") {
+        Some("Packing Valhalla tile extract")
+    } else if line.contains("validation passed:") {
+        Some("Validating routes")
+    } else if line.contains("visual pack:") {
+        Some("Building visual PMTiles")
+    } else if line.contains("visual road index:") {
+        Some("Validating visual road coverage")
+    } else if line.contains("retained visual build:") {
+        Some("Retaining visual package")
+    } else if line.starts_with("built:") {
+        Some("Finalizing package")
+    } else {
+        None
+    }
+}
+
+fn run_process_streaming(
+    app: &AppHandle,
+    state: &BuildState,
+    mut command: Command,
+) -> Result<(), String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Could not start build process: {e}"))?;
+    *state.current_pid.lock().expect("pid lock poisoned") = Some(child.id());
+
+    let stdout = child.stdout.take().ok_or("Build stdout was not available.")?;
+    let stderr = child.stderr.take().ok_or("Build stderr was not available.")?;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+    let tx_out = tx.clone();
+    let out_thread = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx_out.send(line);
+        }
+    });
+    let tx_err = tx.clone();
+    let err_thread = thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = tx_err.send(line);
+        }
+    });
+    drop(tx);
+
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(150)) {
+            Ok(line) => {
+                // Recognize only safe, fixed error signatures. Never retain
+                // arbitrary stderr in the AI diagnostic state or outcome file.
+                let marker = if line.contains("Node ID twice in input") ||
+                    line.contains("Way ID twice in input") {
+                    Some("Node ID twice in input")
+                } else if line.contains("No unvalidated routing package") {
+                    Some("No unvalidated routing package")
+                } else {
+                    None
+                };
+                if let Some(marker) = marker {
+                    if let Ok(mut hint) = state.failure_hint.lock() {
+                        *hint = Some(marker);
+                    }
+                }
+                if let Some(stage) = stage_for_log(&line) {
+                    set_stage(app, state, stage);
+                }
+                emit_log(app, line);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if state.cancel.load(Ordering::SeqCst) {
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Could not wait for build process: {e}"))?;
+    let _ = out_thread.join();
+    let _ = err_thread.join();
+    *state.current_pid.lock().expect("pid lock poisoned") = None;
+
+    if state.cancel.load(Ordering::SeqCst) {
+        return Err("Build cancelled.".into());
+    }
+    if !status.success() {
+        return Err(format!("Build process exited with {status}."));
+    }
+    Ok(())
+}
+
+fn run_build_queue(
+    app: AppHandle,
+    state: BuildState,
+    region_ids: Vec<String>,
+    package_version: String,
+    refresh_sources: bool,
+) -> Result<(), String> {
+    let pipeline = pipeline_root(&app)?;
+    let python = ensure_python_env(&app)?;
+    let work = work_dir(&app)?;
+    let dist = dist_dir(&app)?;
+    let visual_dist = visual_dist_dir(&app)?;
+
+    for (index, region_id) in region_ids.iter().enumerate() {
+        if state.cancel.load(Ordering::SeqCst) {
+            return Err("Build cancelled.".into());
+        }
+
+        {
+            let mut snapshot = state.status.lock().expect("build status poisoned");
+            snapshot.current_region = Some(region_id.clone());
+            snapshot.queue = region_ids[index..].to_vec();
+            snapshot.stage = "Preparing regional build".into();
+            snapshot.last_error = None;
+        }
+        emit_status(&app, &state);
+        emit_log(
+            &app,
+            format!("\n=== {} • {} ===", region_id, package_version),
+        );
+
+        let config = region_config_dir(&app)?.join(format!("{region_id}.json"));
+        if !config.is_file() {
+            return Err(format!("Region config does not exist: {}", config.display()));
+        }
+
+        let mut command = Command::new(&python);
+        command
+            .arg(pipeline.join("tools/build_routing_region.py"))
+            .arg("--config")
+            .arg(&config)
+            .arg("--package-version")
+            .arg(&package_version)
+            .arg("--work-dir")
+            .arg(&work)
+            .arg("--dist-dir")
+            .arg(&dist);
+        if refresh_sources {
+            command.arg("--refresh-sources");
+        }
+        run_process_streaming(&app, &state, command)?;
+
+        set_stage(&app, &state, "Validating completed package");
+        let region_dist = dist.join(region_id);
+        let manifest = fs::read_dir(&region_dist)
+            .map_err(|e| format!("Could not inspect build output: {e}"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| {
+                        name.contains(&package_version) && name.ends_with("-manifest.json")
+                    })
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| format!("No manifest produced for {region_id} {package_version}"))?;
+
+        let status = Command::new(&python)
+            .arg(pipeline.join("tools/validate_routing_pack.py"))
+            .arg("--manifest")
+            .arg(&manifest)
+            .status()
+            .map_err(|e| format!("Could not validate completed package: {e}"))?;
+        if !status.success() {
+            return Err(format!("Routing pack validation failed for {region_id}."));
+        }
+
+        let config_value: Value = serde_json::from_str(
+            &fs::read_to_string(&config)
+                .map_err(|e| format!("Could not read region config for visual build: {e}"))?,
+        )
+        .map_err(|e| format!("Could not parse region config for visual build: {e}"))?;
+        let visual_enabled = config_value
+            .pointer("/visual/enabled")
+            .and_then(Value::as_bool)
+            == Some(true);
+
+        if visual_enabled {
+            set_stage(&app, &state, "Building retained visual package");
+            emit_log(&app, format!("→ {region_id}: building visual PMTiles…"));
+            let mut visual_command = Command::new(&python);
+            visual_command
+                .arg(pipeline.join("tools/build_visual_region_pack.py"))
+                .arg("--config")
+                .arg(&config)
+                .arg("--package-version")
+                .arg(&package_version)
+                .arg("--work-dir")
+                .arg(work.join("visual"))
+                .arg("--source-cache-dir")
+                .arg(work.join("cache"))
+                .arg("--dist-dir")
+                .arg(&visual_dist);
+            if refresh_sources {
+                visual_command.arg("--refresh-sources");
+            }
+            run_process_streaming(&app, &state, visual_command)?;
+            emit_log(&app, format!("✓ {region_id} visual package validated."));
+        }
+
+        let cache = work.join("inspector-cache").join(region_id);
+        let _ = fs::remove_dir_all(cache);
+        emit_log(&app, format!("✓ {region_id} build validated."));
+    }
+
+    emit_log(&app, "✓ Regional builds complete.");
+
+    Ok(())
+}
+
+#[tauri::command]
+fn start_build_queue(
+    app: AppHandle,
+    state: State<'_, BuildState>,
+    region_ids: Vec<String>,
+    package_version: String,
+    refresh_sources: bool,
+) -> Result<(), String> {
+    if region_ids.is_empty() {
+        return Err("Select at least one region.".into());
+    }
+    if !region_ids.iter().all(|id| safe_token(id)) {
+        return Err("One or more region ids are invalid.".into());
+    }
+    if !safe_token(&package_version) {
+        return Err("Package version contains unsupported characters.".into());
+    }
+
+    let owned = state.inner().clone();
+    {
+        let mut status = owned.status.lock().expect("build status poisoned");
+        if status.running {
+            return Err("A graph build is already running.".into());
+        }
+        *status = BuildStatus {
+            running: true,
+            current_region: None,
+            queue: region_ids.clone(),
+            stage: "Starting build queue".into(),
+            started_at_epoch_ms: Some(now_epoch_ms()),
+            last_error: None,
+        };
+    }
+    owned.cancel.store(false, Ordering::SeqCst);
+    *owned.failure_hint.lock().expect("failure hint poisoned") = None;
+    emit_status(&app, &owned);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let outcome_version = package_version.clone();
+        let result = run_build_queue(
+            app.clone(),
+            owned.clone(),
+            region_ids,
+            package_version,
+            refresh_sources,
+        );
+
+        let mut snapshot = owned.status.lock().expect("build status poisoned");
+        let observed_region = snapshot.current_region.clone();
+        let observed_stage = snapshot.stage.clone();
+        let outcome = if result.is_ok() {
+            "succeeded"
+        } else if owned.cancel.load(Ordering::SeqCst) {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        let streamed_failure_hint = owned.failure_hint.lock().ok().and_then(|v| *v);
+        let error_for_classification = streamed_failure_hint.or_else(|| result.as_ref().err().map(String::as_str));
+        // Persist only a stable failure category; never copy subprocess stderr.
+        if let Ok(root) = workspace_root(&app) {
+            if ai_diagnostics::record_build_outcome(
+                &root, observed_region.as_deref(), &outcome_version,
+                &observed_stage, outcome, error_for_classification,
+            ).is_err() {
+                emit_log(&app, "AI build diagnostic outcome could not be recorded.");
+            }
+        }
+        snapshot.running = false;
+        snapshot.current_region = None;
+        snapshot.queue.clear();
+        match result {
+            Ok(()) => {
+                snapshot.stage = "Build queue complete".into();
+                snapshot.last_error = None;
+                emit_log(&app, "✓ Build queue complete.");
+            }
+            Err(error) => {
+                let cancelled = owned.cancel.load(Ordering::SeqCst);
+                snapshot.stage = if cancelled {
+                    "Build cancelled".into()
+                } else {
+                    "Build failed".into()
+                };
+                snapshot.last_error = Some(error.clone());
+                emit_log(&app, format!("✗ {error}"));
+            }
+        }
+        owned.cancel.store(false, Ordering::SeqCst);
+        drop(snapshot);
+        emit_status(&app, &owned);
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_build(state: State<'_, BuildState>) -> Result<(), String> {
+    state.cancel.store(true, Ordering::SeqCst);
+    if let Some(pid) = *state.current_pid.lock().expect("pid lock poisoned") {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn list_builds(app: AppHandle) -> Result<Vec<BuildArtifact>, String> {
+    let root = dist_dir(&app)?;
+    let mut result = Vec::new();
+    let Ok(regions) = fs::read_dir(root) else {
+        return Ok(result);
+    };
+
+    for region_dir in regions.flatten().filter(|entry| entry.path().is_dir()) {
+        let Ok(files) = fs::read_dir(region_dir.path()) else {
+            continue;
+        };
+        for entry in files.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with("-manifest.json") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let Some(artifact) = value.get("artifact") else {
+                continue;
+            };
+            result.push(BuildArtifact {
+                region_id: value
+                    .get("regionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                version: value
+                    .get("packageVersion")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                built_at_utc: value
+                    .get("builtAtUtc")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                artifact_file: artifact
+                    .get("fileName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                size_bytes: artifact
+                    .get("sizeBytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                sha256: artifact
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                tile_count: artifact
+                    .get("tileCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                manifest_path: path.display().to_string(),
+                graph_index_path: value
+                    .pointer("/graphIndex/fileName")
+                    .and_then(Value::as_str)
+                    .map(|name| path.parent().unwrap_or(Path::new(".")).join(name))
+                    .filter(|index_path| index_path.is_file())
+                    .map(|index_path| index_path.display().to_string()),
+                graph_tile_fingerprint: value
+                    .pointer("/graphIndex/graphTileFingerprint")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                internal_fingerprint: value
+                    .pointer("/graphIndex/internalFingerprint")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                boundary_fingerprints: value
+                    .pointer("/graphIndex/boundaryFingerprints")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            });
+        }
+    }
+
+    result.sort_by(|a, b| b.built_at_utc.cmp(&a.built_at_utc));
+    Ok(result)
+}
+
+
+#[tauri::command]
+fn list_search_builds(app: AppHandle) -> Result<Vec<SearchBuildArtifact>, String> {
+    let mut result = Vec::new();
+    for root in search_build_roots(&app)? {
+        let Ok(regions) = fs::read_dir(&root) else { continue; };
+        for region in regions.filter_map(Result::ok) {
+            let region_id = region.file_name().to_string_lossy().to_string();
+            let Ok(versions) = fs::read_dir(region.path()) else { continue; };
+            for version in versions.filter_map(Result::ok) {
+                let version_name = version.file_name().to_string_lossy().to_string();
+                if let Ok((artifact, _)) = load_search_build(&app, &region_id, &version_name) {
+                    result.push(artifact);
+                }
+            }
+        }
+    }
+    result.sort_by(|a, b| a.region_id.cmp(&b.region_id).then_with(|| b.built_at_utc.cmp(&a.built_at_utc)).then_with(|| b.version.cmp(&a.version)));
+    result.dedup_by(|a, b| a.region_id == b.region_id && a.version == b.version);
+    Ok(result)
+}
+
+#[tauri::command]
+fn search_retained_build(
+    app: AppHandle,
+    region_id: String,
+    version: String,
+    query: String,
+    category: String,
+    origin_lat: Option<f64>,
+    origin_lng: Option<f64>,
+    limit: Option<u32>,
+) -> Result<Value, String> {
+    let (_artifact, database) = load_search_build(&app, &region_id, &version)?;
+    let python = ensure_python_env(&app)?;
+    let tool = pipeline_root(&app)?.join("tools/roadpilot_search_v2.py");
+    let mut command = Command::new(&python);
+    command.arg(tool).arg("--database").arg(database);
+    if !query.trim().is_empty() { command.arg("--query").arg(query.trim()); }
+    if !category.trim().is_empty() { command.arg("--category").arg(category.trim()); }
+    if let (Some(lat), Some(lng)) = (origin_lat, origin_lng) {
+        command.arg("--origin-lat").arg(lat.to_string()).arg("--origin-lng").arg(lng.to_string());
+    }
+    command.arg("--limit").arg(limit.unwrap_or(50).clamp(1, 50).to_string()).arg("--json");
+    let output = command.output().map_err(|e| format!("Could not run RoadPilot search runtime: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    serde_json::from_slice(&output.stdout).map_err(|e| format!("Search runtime returned invalid JSON: {e}"))
+}
+
+#[tauri::command]
+fn compare_search_builds(
+    app: AppHandle,
+    region_id: String,
+    version_a: String,
+    version_b: String,
+) -> Result<Value, String> {
+    let (_a, db_a) = load_search_build(&app, &region_id, &version_a)?;
+    let (_b, db_b) = load_search_build(&app, &region_id, &version_b)?;
+    let python = ensure_python_env(&app)?;
+    let tool = pipeline_root(&app)?.join("tools/compare_search_builds.py");
+    let output = Command::new(&python).arg(tool).arg("--a").arg(db_a).arg("--b").arg(db_b)
+        .output().map_err(|e| format!("Could not compare search builds: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    serde_json::from_slice(&output.stdout).map_err(|e| format!("Search comparison returned invalid JSON: {e}"))
+}
+
+#[tauri::command]
+fn list_visual_builds(app: AppHandle) -> Result<Vec<VisualBuildArtifact>, String> {
+    let root = visual_dist_dir(&app)?;
+    let mut result = Vec::new();
+    let Ok(regions) = fs::read_dir(&root) else {
+        return Ok(result);
+    };
+
+    for region_dir in regions.flatten().filter(|entry| entry.path().is_dir()) {
+        let Ok(versions) = fs::read_dir(region_dir.path()) else {
+            continue;
+        };
+        for version_dir in versions.flatten().filter(|entry| entry.path().is_dir()) {
+            let Ok(files) = fs::read_dir(version_dir.path()) else {
+                continue;
+            };
+            for entry in files.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !name.ends_with("-manifest.json") {
+                    continue;
+                }
+                let Ok(text) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                if value.get("schema").and_then(Value::as_str) != Some("roadpilot-visual-pack") {
+                    continue;
+                }
+                let Some(artifact) = value.get("artifact") else {
+                    continue;
+                };
+                let layers = value
+                    .get("layers")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                result.push(VisualBuildArtifact {
+                    region_id: value.get("regionId").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    version: value.get("packageVersion").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    built_at_utc: value.get("builtAtUtc").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    artifact_file: artifact.get("fileName").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    size_bytes: artifact.get("sizeBytes").and_then(Value::as_u64).unwrap_or(0),
+                    sha256: artifact.get("sha256").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    tile_count: artifact.get("tileCount").and_then(Value::as_u64).unwrap_or(0),
+                    min_zoom: artifact.get("minZoom").and_then(Value::as_u64).unwrap_or(0),
+                    max_zoom: artifact.get("maxZoom").and_then(Value::as_u64).unwrap_or(0),
+                    bounds: artifact.get("bounds").cloned().unwrap_or_else(|| json!({})),
+                    source_fingerprint: value.get("sourceFingerprint").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    profile_fingerprint: value.get("profileFingerprint").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    manifest_path: path.display().to_string(),
+                    layers,
+                    road_index_file: value.pointer("/roadIndex/fileName").and_then(Value::as_str).map(str::to_string),
+                    major_road_count: value.pointer("/roadIndex/majorRoadCount").and_then(Value::as_u64).unwrap_or(0),
+                    border_road_count: value.pointer("/roadIndex/borderRoadCount").and_then(Value::as_u64).unwrap_or(0),
+                    missing_road_count: value.pointer("/roadIndex/missingRoadCount").and_then(Value::as_u64).unwrap_or(0),
+                });
+            }
+        }
+    }
+    result.sort_by(|a, b| b.built_at_utc.cmp(&a.built_at_utc));
+    Ok(result)
+}
+
+fn safe_visual_manifest_path(app: &AppHandle, raw: &str) -> Result<PathBuf, String> {
+    let requested = PathBuf::from(raw)
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve visual manifest {raw}: {e}"))?;
+    let root = visual_dist_dir(app)?
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve Graph Studio visual build directory: {e}"))?;
+    if !requested.starts_with(&root) || !requested.is_file() {
+        return Err("Visual manifest is outside the Graph Studio visual-build workspace.".into());
+    }
+    let text = fs::read_to_string(&requested)
+        .map_err(|e| format!("Could not read visual manifest: {e}"))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Could not parse visual manifest: {e}"))?;
+    if value.get("schema").and_then(Value::as_str) != Some("roadpilot-visual-pack") {
+        return Err("Selected manifest is not a RoadPilot visual pack.".into());
+    }
+    Ok(requested)
+}
+
+fn safe_search_manifest_path(app: &AppHandle, raw: &str) -> Result<PathBuf, String> {
+    let requested = PathBuf::from(raw)
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve search manifest {raw}: {e}"))?;
+    if !requested.is_file() {
+        return Err("Selected search manifest is not a file.".into());
+    }
+    let mut inside_retained_root = false;
+    for root in search_build_roots(app)? {
+        if !root.exists() {
+            continue;
+        }
+        let Ok(root) = root.canonicalize() else {
+            continue;
+        };
+        if requested.starts_with(&root) {
+            inside_retained_root = true;
+            break;
+        }
+    }
+    if !inside_retained_root {
+        return Err("Search manifest is outside recognized retained search-build roots.".into());
+    }
+    let text = fs::read_to_string(&requested)
+        .map_err(|e| format!("Could not read search manifest: {e}"))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Could not parse search manifest: {e}"))?;
+    if value.get("schema").and_then(Value::as_str) != Some("roadpilot-search-pack")
+        || value.get("artifactKind").and_then(Value::as_str) != Some("SEARCH")
+    {
+        return Err("Selected manifest is not a RoadPilot search pack.".into());
+    }
+    Ok(requested)
+}
+
+#[tauri::command]
+fn visual_archive_range(
+    app: AppHandle,
+    manifest_path: String,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, String> {
+    const MAX_RANGE: u64 = 4 * 1024 * 1024;
+    if length == 0 || length > MAX_RANGE {
+        return Err(format!("Visual archive range length must be 1..={MAX_RANGE} bytes."));
+    }
+    let manifest_path = safe_visual_manifest_path(&app, &manifest_path)?;
+    let text = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("Could not read visual manifest: {e}"))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Could not parse visual manifest: {e}"))?;
+    let file_name = value
+        .pointer("/artifact/fileName")
+        .and_then(Value::as_str)
+        .ok_or("Visual manifest is missing artifact.fileName.")?;
+    let parent = manifest_path.parent().ok_or("Visual manifest has no parent directory.")?;
+    let package = parent
+        .join(file_name)
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve visual PMTiles artifact: {e}"))?;
+    if !package.starts_with(parent) || !package.is_file() {
+        return Err("Visual PMTiles artifact is outside its retained build directory.".into());
+    }
+
+    let mut file = fs::File::open(&package)
+        .map_err(|e| format!("Could not open visual PMTiles artifact: {e}"))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| format!("Could not stat visual PMTiles artifact: {e}"))?
+        .len();
+    if offset >= file_len {
+        return Err(format!(
+            "Visual archive range starts outside artifact bounds: offset={offset} size={file_len}"
+        ));
+    }
+    let available = file_len - offset;
+    let read_length = length.min(available);
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("Could not seek visual PMTiles artifact: {e}"))?;
+    let mut bytes = vec![0_u8; read_length as usize];
+    file.read_exact(&mut bytes)
+        .map_err(|e| format!("Could not read visual PMTiles range: {e}"))?;
+    Ok(bytes)
+}
+
+fn safe_build_manifest_path(app: &AppHandle, raw: &str) -> Result<PathBuf, String> {
+    let requested = PathBuf::from(raw)
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve build manifest {raw}: {e}"))?;
+    let root = dist_dir(app)?
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve Graph Studio build directory: {e}"))?;
+    if !requested.starts_with(&root) || !requested.is_file() {
+        return Err("Build manifest is outside the Graph Studio build workspace.".into());
+    }
+    Ok(requested)
+}
+
+fn run_r2_json_script(
+    app: &AppHandle,
+    script_name: &str,
+    args: &[String],
+) -> Result<Value, String> {
+    let credentials = read_r2_credentials(app)?;
+    let python = ensure_python_env(app)?;
+    let script = pipeline_root(app)?.join("tools").join(script_name);
+    if !script.is_file() {
+        return Err(format!("Bundled R2 tool is missing: {}", script.display()));
+    }
+    let mut command = Command::new(python);
+    command.arg(script).args(args);
+    apply_r2_env(&mut command, &credentials);
+    let output = command
+        .output()
+        .map_err(|e| format!("Could not run {script_name}: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("{script_name} returned invalid JSON: {e}"))
+}
+
+fn update_publication_from_event(
+    app: &AppHandle,
+    state: &PublicationState,
+    event: &Value,
+) {
+    let kind = event.get("event").and_then(Value::as_str).unwrap_or_default();
+    {
+        let mut status = state.status.lock().expect("publication status poisoned");
+        match kind {
+            "UPLOAD_STARTED" => {
+                status.stage = "Uploading immutable object".into();
+                status.current_key = event.get("key").and_then(Value::as_str).map(str::to_string);
+                status.bytes_transferred = 0;
+                status.total_bytes = event
+                    .get("totalBytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+            }
+            "UPLOAD_PROGRESS" => {
+                status.stage = "Uploading immutable object".into();
+                status.current_key = event.get("key").and_then(Value::as_str).map(str::to_string);
+                status.bytes_transferred = event
+                    .get("bytesTransferred")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(status.bytes_transferred);
+                status.total_bytes = event
+                    .get("totalBytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(status.total_bytes);
+            }
+            "UPLOAD_CONFIRMED" => {
+                status.stage = "R2 object confirmed".into();
+                status.current_key = event.get("key").and_then(Value::as_str).map(str::to_string);
+                status.bytes_transferred = status.total_bytes;
+            }
+            "IMMUTABLE_PRESENT" => {
+                status.stage = "Immutable object already published".into();
+                status.current_key = event.get("key").and_then(Value::as_str).map(str::to_string);
+            }
+            "LATEST_ADVANCED" => {
+                status.stage = "latest.json advanced".into();
+                status.current_key = event.get("key").and_then(Value::as_str).map(str::to_string);
+            }
+            "LATEST_ALREADY_CURRENT" => {
+                status.stage = "latest.json already current".into();
+                status.current_key = event.get("key").and_then(Value::as_str).map(str::to_string);
+            }
+            _ => {}
+        }
+    }
+    emit_publication_event(app, event);
+    emit_publication_status(app, state);
+}
+
+fn run_publication_job(
+    app: AppHandle,
+    state: PublicationState,
+    manifest_path: PathBuf,
+    region_id: String,
+    package_version: String,
+    artifact_kind: String,
+    preparer_script: String,
+    credentials: R2CredentialFile,
+) -> Result<(), String> {
+    let python = ensure_python_env(&app)?;
+    let pipeline = pipeline_root(&app)?;
+    let cache = publication_cache_dir(&app)?;
+    let kind_token = artifact_kind.to_ascii_lowercase();
+    let plan_path = cache.join(format!(
+        "{kind_token}--{region_id}--{package_version}--publication-plan.json"
+    ));
+
+    {
+        let mut status = state.status.lock().expect("publication status poisoned");
+        status.stage = format!("Validating local {kind_token} pack");
+        status.current_key = None;
+        status.bytes_transferred = 0;
+        status.total_bytes = 0;
+    }
+    emit_publication_status(&app, &state);
+
+    let prepare = Command::new(&python)
+        .arg(pipeline.join("tools").join(&preparer_script))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--output")
+        .arg(&plan_path)
+        .output()
+        .map_err(|e| format!("Could not prepare publication plan: {e}"))?;
+    if !prepare.status.success() {
+        return Err(String::from_utf8_lossy(&prepare.stderr).trim().to_string());
+    }
+    for line in String::from_utf8_lossy(&prepare.stdout).lines() {
+        emit_log(&app, format!("R2: {line}"));
+    }
+
+    {
+        let mut status = state.status.lock().expect("publication status poisoned");
+        status.stage = "Publishing verified release to R2".into();
+    }
+    emit_publication_status(&app, &state);
+
+    let mut command = Command::new(&python);
+    command
+        .arg(pipeline.join("tools/publish_publication_plan_r2.py"))
+        .arg("--plan")
+        .arg(&plan_path)
+        .arg("--json-events")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_r2_env(&mut command, &credentials);
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Could not start R2 publisher: {e}"))?;
+    let stdout = child.stdout.take().ok_or("R2 publisher stdout unavailable.")?;
+    let stderr = child.stderr.take().ok_or("R2 publisher stderr unavailable.")?;
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+
+    let tx_out = tx.clone();
+    let out_thread = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx_out.send((true, line));
+        }
+    });
+    let tx_err = tx.clone();
+    let err_thread = thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = tx_err.send((false, line));
+        }
+    });
+    drop(tx);
+
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(150)) {
+            Ok((is_stdout, line)) => {
+                if is_stdout {
+                    if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                        if event.get("event").is_some() {
+                            update_publication_from_event(&app, &state, &event);
+                            continue;
+                        }
+                    }
+                }
+                emit_log(&app, format!("R2: {line}"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let exit = child
+        .wait()
+        .map_err(|e| format!("Could not wait for R2 publisher: {e}"))?;
+    let _ = out_thread.join();
+    let _ = err_thread.join();
+    if !exit.success() {
+        return Err(format!("R2 publisher exited with {exit}."));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn r2_credential_status(app: AppHandle) -> Result<R2CredentialStatus, String> {
+    r2_credential_status_for(&app)
+}
+
+#[tauri::command]
+fn save_r2_credentials(
+    app: AppHandle,
+    account_id: String,
+    bucket: String,
+    access_key_id: String,
+    secret_access_key: String,
+    endpoint_url: Option<String>,
+) -> Result<R2CredentialStatus, String> {
+    let existing = read_r2_credentials(&app).ok();
+    let access_key_id = if access_key_id.trim().is_empty() {
+        existing
+            .as_ref()
+            .map(|value| value.access_key_id.clone())
+            .unwrap_or_default()
+    } else {
+        access_key_id.trim().to_string()
+    };
+    let secret_access_key = if secret_access_key.trim().is_empty() {
+        existing
+            .as_ref()
+            .map(|value| value.secret_access_key.clone())
+            .unwrap_or_default()
+    } else {
+        secret_access_key.trim().to_string()
+    };
+    let credentials = R2CredentialFile {
+        account_id: account_id.trim().to_string(),
+        bucket: bucket.trim().to_string(),
+        access_key_id,
+        secret_access_key,
+        endpoint_url: endpoint_url
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty()),
+    };
+    write_r2_credentials(&app, &credentials)?;
+    r2_credential_status_for(&app)
+}
+
+#[tauri::command]
+fn clear_r2_credentials(app: AppHandle) -> Result<R2CredentialStatus, String> {
+    let path = r2_credentials_path(&app)?;
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Could not remove local R2 credentials: {error}")),
+    }
+    r2_credential_status_for(&app)
+}
+
+#[tauri::command]
+fn test_r2_credentials(app: AppHandle) -> Result<Value, String> {
+    run_r2_json_script(
+        &app,
+        "test_r2_connection.py",
+        &["--prefix".into(), "routing".into(), "--json".into()],
+    )
+}
+
+#[tauri::command]
+fn r2_region_publication_status(
+    app: AppHandle,
+    region_id: String,
+    prefix: String,
+) -> Result<Value, String> {
+    if !safe_token(&region_id) {
+        return Err("Invalid region id.".into());
+    }
+    if !matches!(prefix.as_str(), "routing" | "visual" | "search") {
+        return Err("Publication prefix must be routing, visual or search.".into());
+    }
+    run_r2_json_script(
+        &app,
+        "inspect_r2_publication.py",
+        &[
+            "--region".into(),
+            region_id,
+            "--prefix".into(),
+            prefix,
+        ],
+    )
+}
+
+#[tauri::command]
+fn publication_status(state: State<'_, PublicationState>) -> Result<PublicationStatus, String> {
+    Ok(state
+        .status
+        .lock()
+        .expect("publication status poisoned")
+        .clone())
+}
+
+#[tauri::command]
+fn start_r2_publication(
+    app: AppHandle,
+    state: State<'_, PublicationState>,
+    manifest_path: String,
+    artifact_kind: String,
+) -> Result<(), String> {
+    let artifact_kind = artifact_kind.trim().to_ascii_uppercase();
+    let (manifest_path, expected_schema, preparer_script) = match artifact_kind.as_str() {
+        "ROUTING" => (
+            safe_build_manifest_path(&app, &manifest_path)?,
+            "roadpilot-routing-pack",
+            "prepare_routing_publication.py",
+        ),
+        "VISUAL" => (
+            safe_visual_manifest_path(&app, &manifest_path)?,
+            "roadpilot-visual-pack",
+            "prepare_visual_publication.py",
+        ),
+        "SEARCH" => (
+            safe_search_manifest_path(&app, &manifest_path)?,
+            "roadpilot-search-pack",
+            "prepare_search_publication.py",
+        ),
+        _ => return Err("Publication artifactKind must be ROUTING, VISUAL or SEARCH.".into()),
+    };
+
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("Could not read selected publication manifest: {e}"))?;
+    let manifest: Value = serde_json::from_str(&manifest_text)
+        .map_err(|e| format!("Could not parse selected publication manifest: {e}"))?;
+    if manifest.get("schema").and_then(Value::as_str) != Some(expected_schema) {
+        return Err(format!(
+            "Selected build is not a RoadPilot {artifact_kind} pack."
+        ));
+    }
+    let region_id = manifest
+        .get("regionId")
+        .and_then(Value::as_str)
+        .ok_or("Selected manifest is missing regionId.")?
+        .to_string();
+    let version_field = if artifact_kind == "SEARCH" { "packVersion" } else { "packageVersion" };
+    let package_version = manifest
+        .get(version_field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Selected manifest is missing {version_field}."))?
+        .to_string();
+    if !safe_token(&region_id) || !safe_token(&package_version) {
+        return Err("Selected manifest has unsafe region/version identity.".into());
+    }
+    let credentials = read_r2_credentials(&app)?;
+
+    let owned = state.inner().clone();
+    {
+        let mut status = owned.status.lock().expect("publication status poisoned");
+        if status.running {
+            return Err("An R2 publication is already running.".into());
+        }
+        *status = PublicationStatus {
+            running: true,
+            region_id: Some(region_id.clone()),
+            package_version: Some(package_version.clone()),
+            stage: format!("Starting {} publication", artifact_kind.to_ascii_lowercase()),
+            current_key: None,
+            bytes_transferred: 0,
+            total_bytes: 0,
+            last_error: None,
+        };
+    }
+    emit_publication_status(&app, &owned);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = run_publication_job(
+            app.clone(),
+            owned.clone(),
+            manifest_path,
+            region_id,
+            package_version,
+            artifact_kind.clone(),
+            preparer_script.to_string(),
+            credentials,
+        );
+        let mut status = owned.status.lock().expect("publication status poisoned");
+        status.running = false;
+        status.current_key = None;
+        status.bytes_transferred = 0;
+        status.total_bytes = 0;
+        match result {
+            Ok(()) => {
+                status.stage = format!(
+                    "{} publication complete",
+                    artifact_kind.to_ascii_lowercase()
+                );
+                status.last_error = None;
+                emit_log(
+                    &app,
+                    format!("✓ {artifact_kind} R2 publication complete."),
+                );
+            }
+            Err(error) => {
+                status.stage = format!(
+                    "{} publication failed",
+                    artifact_kind.to_ascii_lowercase()
+                );
+                status.last_error = Some(error.clone());
+                emit_log(
+                    &app,
+                    format!("✗ {artifact_kind} R2 publication failed: {error}"),
+                );
+            }
+        }
+        drop(status);
+        emit_publication_status(&app, &owned);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn activate_r2_release(app: AppHandle, release_key: String) -> Result<Value, String> {
+    if !(release_key.starts_with("routing/") || release_key.starts_with("visual/") || release_key.starts_with("search/"))
+        || !release_key.ends_with("/release.json")
+        || release_key.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err("Unsafe R2 release key.".into());
+    }
+    let credentials = read_r2_credentials(&app)?;
+    let python = ensure_python_env(&app)?;
+    let script = pipeline_root(&app)?.join("tools/activate_publication_release_r2.py");
+    let report_path = publication_cache_dir(&app)?.join("last-activation-report.json");
+    let mut command = Command::new(python);
+    command
+        .arg(script)
+        .arg("--release-key")
+        .arg(&release_key)
+        .arg("--report")
+        .arg(&report_path);
+    apply_r2_env(&mut command, &credentials);
+    let output = command
+        .output()
+        .map_err(|e| format!("Could not activate R2 release: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let text = fs::read_to_string(&report_path)
+        .map_err(|e| format!("Could not read R2 activation report: {e}"))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("R2 activation report was invalid: {e}"))
+}
+
+fn graph_index_for_manifest(app: &AppHandle, raw: &str) -> Result<Value, String> {
+    let manifest_path = safe_build_manifest_path(app, raw)?;
+    let text = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("Could not read {}: {e}", manifest_path.display()))?;
+    let manifest: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Could not parse {}: {e}", manifest_path.display()))?;
+    let index_name = manifest
+        .pointer("/graphIndex/fileName")
+        .and_then(Value::as_str)
+        .ok_or("Selected build predates deterministic graph indexes; rebuild it with current Graph Studio.")?;
+    let index_path = manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(index_name);
+    let index_text = fs::read_to_string(&index_path)
+        .map_err(|e| format!("Could not read graph index {}: {e}", index_path.display()))?;
+    let index: Value = serde_json::from_str(&index_text)
+        .map_err(|e| format!("Could not parse graph index {}: {e}", index_path.display()))?;
+    Ok(json!({"manifest": manifest, "index": index}))
+}
+
+fn graph_index_tiles(index: &Value) -> BTreeMap<String, Value> {
+    index
+        .get("tiles")
+        .and_then(Value::as_array)
+        .map(|tiles| {
+            tiles
+                .iter()
+                .filter_map(|tile| {
+                    let path = tile.get("path")?.as_str()?.to_string();
+                    Some((path, tile.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn graph_index_boundary_fingerprints(index: &Value) -> BTreeMap<String, String> {
+    index
+        .get("boundaries")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some((
+                        item.get("sourceId")?.as_str()?.to_string(),
+                        item.get("fingerprint")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn tile_boundary_ids(tile: Option<&Value>) -> BTreeSet<String> {
+    tile.and_then(|value| value.get("boundaries"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn tile_bounds_feature(path: &str, status: &str, boundaries: &BTreeSet<String>, tile: &Value) -> Option<Value> {
+    let bounds = tile.get("bounds")?;
+    let min_lat = bounds.get("minLat")?.as_f64()?;
+    let max_lat = bounds.get("maxLat")?.as_f64()?;
+    let min_lng = bounds.get("minLng")?.as_f64()?;
+    let max_lng = bounds.get("maxLng")?.as_f64()?;
+    Some(json!({
+        "type": "Feature",
+        "properties": {
+            "path": path,
+            "status": status,
+            "boundaries": boundaries.iter().cloned().collect::<Vec<_>>()
+        },
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [min_lng, min_lat],
+                [max_lng, min_lat],
+                [max_lng, max_lat],
+                [min_lng, max_lat],
+                [min_lng, min_lat]
+            ]]
+        }
+    }))
+}
+
+#[tauri::command]
+fn compare_build_indexes(
+    app: AppHandle,
+    manifest_path_a: String,
+    manifest_path_b: String,
+) -> Result<Value, String> {
+    let a = graph_index_for_manifest(&app, &manifest_path_a)?;
+    let b = graph_index_for_manifest(&app, &manifest_path_b)?;
+    let manifest_a = a.get("manifest").ok_or("Build A manifest was not loaded.")?;
+    let manifest_b = b.get("manifest").ok_or("Build B manifest was not loaded.")?;
+    let region_a = manifest_a.get("regionId").and_then(Value::as_str).unwrap_or_default();
+    let region_b = manifest_b.get("regionId").and_then(Value::as_str).unwrap_or_default();
+    if region_a.is_empty() || region_a != region_b {
+        return Err("Detailed build comparison requires two builds of the same region.".into());
+    }
+
+    let index_a = a.get("index").ok_or("Build A graph index was not loaded.")?;
+    let index_b = b.get("index").ok_or("Build B graph index was not loaded.")?;
+    let tiles_a = graph_index_tiles(index_a);
+    let tiles_b = graph_index_tiles(index_b);
+    let paths: BTreeSet<String> = tiles_a.keys().chain(tiles_b.keys()).cloned().collect();
+
+    let mut added_tiles = 0_u64;
+    let mut removed_tiles = 0_u64;
+    let mut changed_tiles = 0_u64;
+    let mut internal_changed_tiles = 0_u64;
+    let mut boundary_changed_tiles = 0_u64;
+    let mut boundary_counts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut changed_boundary_features = Vec::new();
+
+    for path in paths {
+        let old = tiles_a.get(&path);
+        let new = tiles_b.get(&path);
+        let old_sha = old.and_then(|tile| tile.get("sha256")).and_then(Value::as_str);
+        let new_sha = new.and_then(|tile| tile.get("sha256")).and_then(Value::as_str);
+        let status = match (old, new) {
+            (None, Some(_)) => {
+                added_tiles += 1;
+                "added"
+            }
+            (Some(_), None) => {
+                removed_tiles += 1;
+                "removed"
+            }
+            (Some(_), Some(_)) if old_sha != new_sha => {
+                changed_tiles += 1;
+                "changed"
+            }
+            _ => continue,
+        };
+
+        let old_boundaries = tile_boundary_ids(old);
+        let new_boundaries = tile_boundary_ids(new);
+        let boundaries: BTreeSet<String> = old_boundaries
+            .union(&new_boundaries)
+            .cloned()
+            .collect();
+        if boundaries.is_empty() {
+            internal_changed_tiles += 1;
+            continue;
+        }
+        boundary_changed_tiles += 1;
+        for boundary in &boundaries {
+            *boundary_counts.entry(boundary.clone()).or_insert(0) += 1;
+        }
+        if let Some(tile) = new.or(old) {
+            if let Some(feature) = tile_bounds_feature(&path, status, &boundaries, tile) {
+                changed_boundary_features.push(feature);
+            }
+        }
+    }
+
+    let fp_a = graph_index_boundary_fingerprints(index_a);
+    let fp_b = graph_index_boundary_fingerprints(index_b);
+    let boundary_ids: BTreeSet<String> = fp_a.keys().chain(fp_b.keys()).cloned().collect();
+    let boundaries: Vec<Value> = boundary_ids
+        .into_iter()
+        .map(|source_id| {
+            let old = fp_a.get(&source_id).cloned();
+            let new = fp_b.get(&source_id).cloned();
+            json!({
+                "sourceId": source_id,
+                "oldFingerprint": old,
+                "newFingerprint": new,
+                "requiresRefresh": old != new,
+                "changedTiles": boundary_counts.get(&source_id).copied().unwrap_or(0)
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "regionId": region_a,
+        "versionA": manifest_a.get("packageVersion").cloned().unwrap_or(Value::Null),
+        "versionB": manifest_b.get("packageVersion").cloned().unwrap_or(Value::Null),
+        "graphTileFingerprintA": index_a.get("graphTileFingerprint").cloned().unwrap_or(Value::Null),
+        "graphTileFingerprintB": index_b.get("graphTileFingerprint").cloned().unwrap_or(Value::Null),
+        "internalFingerprintA": index_a.get("internalFingerprint").cloned().unwrap_or(Value::Null),
+        "internalFingerprintB": index_b.get("internalFingerprint").cloned().unwrap_or(Value::Null),
+        "counts": {
+            "addedTiles": added_tiles,
+            "removedTiles": removed_tiles,
+            "changedTiles": changed_tiles,
+            "internalChangedTiles": internal_changed_tiles,
+            "boundaryChangedTiles": boundary_changed_tiles
+        },
+        "boundaries": boundaries,
+        "changedBoundaryTiles": {
+            "type": "FeatureCollection",
+            "features": changed_boundary_features
+        }
+    }))
+}
+
+fn valhalla_config_for(app: &AppHandle, region_id: &str) -> Result<PathBuf, String> {
+    if !safe_token(region_id) {
+        return Err("Invalid region id.".into());
+    }
+    let config = work_dir(app)?
+        .join(region_id)
+        .join("build")
+        .join("valhalla.json");
+    if !config.is_file() {
+        return Err(format!(
+            "No local inspected graph exists for {region_id}. Build the region first."
+        ));
+    }
+    Ok(config)
+}
+
+fn valhalla_config_for_build(app: &AppHandle, raw_manifest_path: &str) -> Result<PathBuf, String> {
+    let manifest_path = safe_build_manifest_path(app, raw_manifest_path)?;
+    let text = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("Could not read {}: {e}", manifest_path.display()))?;
+    let manifest: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Could not parse {}: {e}", manifest_path.display()))?;
+
+    let region_id = manifest
+        .get("regionId")
+        .and_then(Value::as_str)
+        .ok_or("Build manifest is missing regionId.")?;
+    let version = manifest
+        .get("packageVersion")
+        .and_then(Value::as_str)
+        .ok_or("Build manifest is missing packageVersion.")?;
+    if !safe_token(region_id) || !safe_token(version) {
+        return Err("Build manifest contains an unsafe region/version identifier.".into());
+    }
+
+    let artifact_name = manifest
+        .pointer("/artifact/fileName")
+        .and_then(Value::as_str)
+        .ok_or("Build manifest is missing artifact.fileName.")?;
+    let manifest_dir = manifest_path
+        .parent()
+        .ok_or("Build manifest has no parent directory.")?
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve build directory: {e}"))?;
+    let artifact_path = manifest_dir
+        .join(artifact_name)
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve retained routing pack {artifact_name}: {e}"))?;
+    if !artifact_path.starts_with(&manifest_dir) || !artifact_path.is_file() {
+        return Err("Retained routing pack is outside the build directory or missing.".into());
+    }
+
+    let base_config_path = valhalla_config_for(app, region_id)?;
+    let base_text = fs::read_to_string(&base_config_path)
+        .map_err(|e| format!("Could not read {}: {e}", base_config_path.display()))?;
+    let mut config: Value = serde_json::from_str(&base_text)
+        .map_err(|e| format!("Could not parse {}: {e}", base_config_path.display()))?;
+
+    let cache = workspace_root(app)?
+        .join("cache")
+        .join("build-diff")
+        .join(format!("{region_id}--{version}"));
+    let empty_tiles = cache.join("tiles");
+    fs::create_dir_all(&empty_tiles)
+        .map_err(|e| format!("Could not create historical graph cache: {e}"))?;
+    let config_path = cache.join("valhalla.json");
+
+    let mjolnir = config
+        .get_mut("mjolnir")
+        .and_then(Value::as_object_mut)
+        .ok_or("Valhalla config is missing mjolnir settings.")?;
+    mjolnir.insert(
+        "tile_extract".into(),
+        Value::String(artifact_path.display().to_string()),
+    );
+    mjolnir.insert(
+        "tile_dir".into(),
+        Value::String(empty_tiles.display().to_string()),
+    );
+    mjolnir.remove("traffic_extract");
+
+    let serialized = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("Could not serialize historical Valhalla config: {e}"))?;
+    fs::write(&config_path, serialized)
+        .map_err(|e| format!("Could not write {}: {e}", config_path.display()))?;
+    Ok(config_path)
+}
+
+fn render_graph_tile(config: &Path, z: u8, x: u32, y: u32) -> Result<Vec<u8>, String> {
+    if z > 30 {
+        return Err("Invalid graph tile zoom.".into());
+    }
+    let max = if z >= 32 { u64::MAX } else { 1_u64 << z };
+    if u64::from(x) >= max || u64::from(y) >= max {
+        return Err("Invalid graph tile coordinate.".into());
+    }
+
+    let request = json!({
+        "tile": {"z": z, "x": x, "y": y},
+        "generalize": 1.0,
+        "filters": {
+            "action": "include",
+            "attributes": [
+                "edge.osm_id",
+                "edge.country_crossing",
+                "edge.use",
+                "edge.access_forward",
+                "edge.access_backward",
+                "edge.length",
+                "edge.speed_forward",
+                "edge.speed_backward",
+                "edge.speed_limit",
+                "edge.tunnel",
+                "edge.bridge",
+                "edge.roundabout",
+                "edge.destination_only",
+                "edge.unpaved",
+                "edge.surface",
+                "edge.ramp",
+                "edge.not_thru",
+                "edge.layer"
+            ]
+        }
+    })
+    .to_string();
+    let output = Command::new("valhalla_service")
+        .arg(config)
+        .arg("tile")
+        .arg(request)
+        .output()
+        .map_err(|e| format!("Could not render Valhalla graph tile: {e}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    if output.stdout.is_empty() {
+        return Err("Valhalla returned an empty graph tile.".into());
+    }
+    Ok(output.stdout)
+}
+
+#[tauri::command]
+fn graph_tile_for_build(
+    app: AppHandle,
+    manifest_path: String,
+    z: u8,
+    x: u32,
+    y: u32,
+) -> Result<Vec<u8>, String> {
+    let config = valhalla_config_for_build(&app, &manifest_path)?;
+    render_graph_tile(&config, z, x, y)
+}
+
+fn validate_route_request(
+    start_lat: f64,
+    start_lng: f64,
+    end_lat: f64,
+    end_lng: f64,
+    costing: &str,
+) -> Result<(), String> {
+    for (label, lat, lng) in [
+        ("start", start_lat, start_lng),
+        ("end", end_lat, end_lng),
+    ] {
+        if !lat.is_finite()
+            || !lng.is_finite()
+            || !(-90.0..=90.0).contains(&lat)
+            || !(-180.0..=180.0).contains(&lng)
+        {
+            return Err(format!("Invalid {label} coordinate."));
+        }
+    }
+    match costing {
+        "motorcycle" | "auto" | "bicycle" | "pedestrian" => Ok(()),
+        _ => Err(format!("Unsupported Graph Studio costing: {costing}")),
+    }
+}
+
+fn decode_polyline6(encoded: &str) -> Result<Vec<Value>, String> {
+    let bytes = encoded.as_bytes();
+    let mut index = 0usize;
+    let mut latitude = 0_i64;
+    let mut longitude = 0_i64;
+    let mut coordinates = Vec::new();
+
+    fn next_value(bytes: &[u8], index: &mut usize) -> Result<i64, String> {
+        let mut result = 0_i64;
+        let mut shift = 0_u32;
+        loop {
+            let Some(byte) = bytes.get(*index).copied() else {
+                return Err("Truncated Valhalla route polyline.".into());
+            };
+            *index += 1;
+            let value = i64::from(byte.saturating_sub(63));
+            result |= (value & 0x1f) << shift;
+            shift += 5;
+            if value < 0x20 {
+                break;
+            }
+            if shift > 60 {
+                return Err("Invalid Valhalla route polyline.".into());
+            }
+        }
+        Ok(if result & 1 != 0 {
+            !(result >> 1)
+        } else {
+            result >> 1
+        })
+    }
+
+    while index < bytes.len() {
+        latitude += next_value(bytes, &mut index)?;
+        longitude += next_value(bytes, &mut index)?;
+        coordinates.push(json!([
+            longitude as f64 / 1_000_000.0,
+            latitude as f64 / 1_000_000.0
+        ]));
+    }
+    Ok(coordinates)
+}
+
+fn route_geometry(response: &Value) -> Result<Value, String> {
+    let legs = response
+        .pointer("/trip/legs")
+        .and_then(Value::as_array)
+        .ok_or("Valhalla route response did not contain trip.legs.")?;
+    let mut coordinates: Vec<Value> = Vec::new();
+    for leg in legs {
+        let shape = leg
+            .get("shape")
+            .and_then(Value::as_str)
+            .ok_or("Valhalla route leg did not contain an encoded shape.")?;
+        let mut leg_coordinates = decode_polyline6(shape)?;
+        if !coordinates.is_empty() && !leg_coordinates.is_empty() {
+            leg_coordinates.remove(0);
+        }
+        coordinates.extend(leg_coordinates);
+    }
+    if coordinates.len() < 2 {
+        return Err("Valhalla route returned insufficient geometry.".into());
+    }
+    Ok(json!({
+        "type": "LineString",
+        "coordinates": coordinates
+    }))
+}
+
+fn valhalla_route_request(
+    start_lat: f64,
+    start_lng: f64,
+    end_lat: f64,
+    end_lng: f64,
+    costing: &str,
+    costing_options: Option<Value>,
+) -> Value {
+    let mut request = json!({
+        "locations": [
+            {"lat": start_lat, "lon": start_lng},
+            {"lat": end_lat, "lon": end_lng}
+        ],
+        "costing": costing,
+        "directions_options": {"units": "kilometers"}
+    });
+    if let Some(options) = costing_options {
+        if !options.is_null() {
+            request["costing_options"] = options;
+        }
+    }
+    request
+}
+
+#[tauri::command]
+fn plan_route(
+    app: AppHandle,
+    region_id: String,
+    start_lat: f64,
+    start_lng: f64,
+    end_lat: f64,
+    end_lng: f64,
+    costing: String,
+    costing_options: Option<Value>,
+) -> Result<Value, String> {
+    validate_route_request(start_lat, start_lng, end_lat, end_lng, &costing)?;
+    let config = valhalla_config_for(&app, &region_id)?;
+    let request = valhalla_route_request(
+        start_lat,
+        start_lng,
+        end_lat,
+        end_lng,
+        &costing,
+        costing_options,
+    );
+
+    let started = Instant::now();
+    let response = ai_verify::run_gui_json(
+        &route_service_executable(), &config, "route", &request,
+    ).map_err(|category| format!("Region {region_id}: Valhalla route {category}"))?;
+    let elapsed_ms = started.elapsed().as_millis();
+    // Do not mistake a parseable Valhalla error response for a route.
+    if response.pointer("/trip/status").and_then(Value::as_i64) != Some(0) {
+        let code = response.pointer("/error_code").and_then(Value::as_i64)
+            .or_else(|| response.pointer("/trip/status").and_then(Value::as_i64));
+        return Err(format!("Region {region_id}: Valhalla returned no successful route (status {code:?})."));
+    }
+    let geometry = route_geometry(&response)?;
+    // Preserve useful partial geometry, but expose whether it really arrives.
+    let arrival = ai_verify::route_arrival_evidence(
+        &geometry, start_lat, start_lng, end_lat, end_lng,
+    ).map_err(|category| format!("Region {region_id}: route {category}"))?;
+
+    Ok(json!({
+        "elapsedMs": elapsed_ms,
+        "geometry": geometry,
+        "arrival": arrival,
+        "response": response
+    }))
+}
+
+#[tauri::command]
+fn route_expansion(
+    app: AppHandle,
+    region_id: String,
+    start_lat: f64,
+    start_lng: f64,
+    end_lat: f64,
+    end_lng: f64,
+    costing: String,
+    costing_options: Option<Value>,
+) -> Result<Value, String> {
+    validate_route_request(start_lat, start_lng, end_lat, end_lng, &costing)?;
+    let config = valhalla_config_for(&app, &region_id)?;
+    let mut request = valhalla_route_request(
+        start_lat,
+        start_lng,
+        end_lat,
+        end_lng,
+        &costing,
+        costing_options,
+    );
+    request["action"] = Value::String("route".into());
+    request["dedupe"] = Value::Bool(true);
+    request["expansion_properties"] = json!([
+        "duration",
+        "distance",
+        "cost",
+        "edge_status",
+        "edge_id",
+        "pred_edge_id",
+        "expansion_type"
+    ]);
+
+    let started = Instant::now();
+    let expansion = ai_verify::run_gui_json(
+        &route_service_executable(), &config, "expansion", &request,
+    ).map_err(|category| format!("Region {region_id}: Valhalla expansion {category}"))?;
+    let elapsed_ms = started.elapsed().as_millis();
+    let feature_count = expansion
+        .get("features")
+        .and_then(Value::as_array)
+        .map(|features| features.len())
+        .unwrap_or(0);
+
+    Ok(json!({
+        "elapsedMs": elapsed_ms,
+        "featureCount": feature_count,
+        "geojson": expansion
+    }))
+}
+
+#[tauri::command]
+fn inspect_locate(
+    app: AppHandle,
+    region_id: String,
+    lat: f64,
+    lng: f64,
+) -> Result<Value, String> {
+    if !lat.is_finite() || !lng.is_finite() || !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
+        return Err("Invalid inspection coordinate.".into());
+    }
+    let config = valhalla_config_for(&app, &region_id)?;
+    let request = json!({
+        "locations": [{"lat": lat, "lon": lng}],
+        "verbose": true
+    });
+    ai_verify::run_gui_json(&route_service_executable(), &config, "locate", &request)
+        .map_err(|category| format!("Region {region_id}: Valhalla locate {category}"))
+}
+
+#[tauri::command]
+fn graph_tile(
+    app: AppHandle,
+    region_id: String,
+    z: u8,
+    x: u32,
+    y: u32,
+) -> Result<Vec<u8>, String> {
+    let config = valhalla_config_for(&app, &region_id)?;
+    render_graph_tile(&config, z, x, y)
+}
+
+#[tauri::command]
+fn ai_control_command(
+    app: AppHandle,
+    state: State<'_, BuildState>,
+    command: String,
+) -> Result<Value, String> {
+    // Unlike normal build operations, inspection must not create a workspace.
+    let root = app.path()
+        .home_dir()
+        .map_err(|e| format!("Could not resolve home directory: {e}"))?
+        .join("ValhallaGraphStudio");
+    // Only selected status fields are exposed. Raw errors may contain paths,
+    // secrets or arbitrary subprocess output and must not reach the AI layer.
+    let snapshot = state.status.lock().map_err(|_| "Build status lock poisoned.")?.clone();
+    let runtime = json!({
+        "running": snapshot.running,
+        "currentRegion": snapshot.current_region,
+        "queueLength": snapshot.queue.len(),
+        "stage": snapshot.stage,
+        "startedAtEpochMs": snapshot.started_at_epoch_ms
+    });
+    ai_control::execute(&root, &command, Some(runtime))
+}
+
+/// On-demand real Valhalla route verification, never an implicit background job.
+/// Unlike the existing GUI's plan_route, this exposes only bounded numeric
+/// evidence and excludes the complete Valhalla reply or geometry.
+#[tauri::command]
+async fn ai_verify_route(
+    app: AppHandle,
+    state: State<'_, BuildState>,
+    region_id: String,
+    start_lat: f64,
+    start_lng: f64,
+    end_lat: f64,
+    end_lng: f64,
+    costing: String,
+) -> Result<Value, String> {
+    // The headless CLI can't observe process state, but the Tauri wrapper can.
+    if state.status.lock().map_err(|_| "Build status lock poisoned.")?.running {
+        return Err("A graph build is running. AI route verification is unavailable.".into());
+    }
+    let workspace = app.path().home_dir()
+        .map_err(|_| "Could not resolve home directory")?
+        .join("ValhallaGraphStudio");
+    let probe = ai_verify::RouteProbe {
+        region_id, start_lat, start_lng, end_lat, end_lng, costing,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        ai_verify::verify_route(&workspace, &probe)
+    }).await.map_err(|_| "AI route verification worker failed".to_string())?
+}
+
+pub fn run() {
+    normalize_process_path();
+    tauri::Builder::default()
+        .manage(BuildState::default())
+        .manage(PublicationState::default())
+        .invoke_handler(tauri::generate_handler![
+            ai_control_command,
+            ai_verify_route,
+            list_regions,
+            geofabrik_catalog,
+            preview_region,
+            load_region_config,
+            save_region_config,
+            toolchain_status,
+            system_stats,
+            build_status,
+            start_build_queue,
+            cancel_build,
+            list_builds,
+            list_visual_builds,
+            list_search_builds,
+            search_retained_build,
+            compare_search_builds,
+            visual_archive_range,
+            r2_credential_status,
+            save_r2_credentials,
+            clear_r2_credentials,
+            test_r2_credentials,
+            r2_region_publication_status,
+            publication_status,
+            start_r2_publication,
+            activate_r2_release,
+            compare_build_indexes,
+            plan_route,
+            route_expansion,
+            inspect_locate,
+            graph_tile,
+            graph_tile_for_build
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running Valhalla Graph Studio");
+}

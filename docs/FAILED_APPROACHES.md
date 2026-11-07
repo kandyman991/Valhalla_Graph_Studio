@@ -24,11 +24,6 @@ Unexecuted ideas are REJECTED_BY_DESIGN or INCONCLUSIVE, never reported as teste
 - Same reason as R-001: unchanged shipping unit would be the region, and a rebuild renumbers across regions.
 - Reconsider only if: as R-001.
 
-## R-003 - Independent regional builds joined by a RoadPilot-owned layer (F8) only
-- Status: not rejected; this is the current production approach and the fallback here.
-- Limitation motivating this project: cross-region routing depends on runtime or precomputed discovery of crossings instead of native graph links.
-- See `RoadPilot-Offline-Data` `docs/ARCHITECTURE_CONTRACT.md` and `docs/FAILED_APPROACHES.md`.
-
 ## VGL-001 - Recomposition of independently built modules (from valhalla-graph-lab)
 - Status: INCONCLUSIVE (recorded there on 2026-10-24)
 - That entry states the research plan was not executed as a production validation. This project continues the question with a ledger-based method and Phases 0-5 as the discriminating experiments.

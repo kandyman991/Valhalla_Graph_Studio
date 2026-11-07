@@ -40,12 +40,11 @@ Rule for every phase: change one variable at a time, record inputs and hashes, k
 - **Pass:** cross-border routes work natively in one tile directory and the measured delta supports the "small delta" claim, or the claim is revised with data.
 
 ## Phase 7 - Manifest and update protocol
-- Tile-level manifest, seam dependencies, atomic apply, runtime consistency check, fallback to F8.
+- Tile-level manifest, seam dependencies, atomic apply, runtime consistency check, behaviour on mismatched seams.
 - Reuse the R2 immutable-publication pattern.
 
-## Phase 8 - Integration (requires owner approval)
-- Android ingestion, Graph Studio UI for ledger and dirty-set inspection, F8 parity evidence.
-- Cannot start without a recorded superseding decision in the RoadPilot repositories (see `CONTRACT_INTERACTION.md`).
+## Phase 8 - Integration
+- Client ingestion of tile-level updates, Graph Studio UI for ledger and dirty-set inspection.
 
 ## Out of scope for now
 Planet-scale builds, client-side graph generation, traffic data, transit.

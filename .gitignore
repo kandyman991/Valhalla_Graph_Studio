@@ -19,3 +19,10 @@ __pycache__/
 *.pyc
 .venv/
 node_modules/
+
+# Graph Studio app build outputs (generated)
+graph-studio/dist/
+graph-studio/node_modules/
+graph-studio/src-tauri/target/
+graph-studio/src-tauri/gen/
+graph-studio/src-tauri/icons/

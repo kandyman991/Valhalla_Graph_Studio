@@ -5,8 +5,7 @@ An **ID-stable Valhalla graph builder**: tooling to build Valhalla routing graph
 - regions built at different times still connect natively at their borders, and
 - an OSM update changes only the tiles that really changed, so users download a small delta instead of whole regions.
 
-> **Status: design phase. This repository currently contains documentation only; no code has been written or verified yet.**
-> Nothing here is approved for production use. See [`docs/CONTRACT_INTERACTION.md`](docs/CONTRACT_INTERACTION.md).
+> **Status: design phase for the ID-stable builder (no ledger or rewriter code yet). The imported desktop app and build tooling are present but unused for this purpose so far.**
 
 Not to be confused with the *RoadPilot Graph Studio* desktop app in `RoadPilot-Offline-Data`; this project is a graph-builder research and tooling effort that may later feed it.
 
@@ -27,6 +26,10 @@ Valhalla tiles reference each other by binary IDs (hierarchy level, tile, index 
 
 Details: [`docs/DESIGN.md`](docs/DESIGN.md). Plan: [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
+## Desktop app (imported)
+
+`graph-studio/` is a Tauri + TypeScript workstation for building, inspecting, comparing and publishing Valhalla graphs, imported from RoadPilot Graph Studio with its cross-region and border-inspection features removed. It compiles and type-checks; it has not been launched or used for a real build here. See [`graph-studio/README.md`](graph-studio/README.md) and [`docs/IMPORT_PROVENANCE.md`](docs/IMPORT_PROVENANCE.md). Its build pipeline lives in `tools/`, `config/`, `schemas/`; `native/edge-scan-seed/` holds unwired C++ seed code for the tile reader.
+
 ## Documentation
 
 | Document | Purpose |
@@ -37,7 +40,7 @@ Details: [`docs/DESIGN.md`](docs/DESIGN.md). Plan: [`docs/ROADMAP.md`](docs/ROAD
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Decision log |
 | [`docs/FAILED_APPROACHES.md`](docs/FAILED_APPROACHES.md) | Rejected and inconclusive approaches, with status definitions |
 | [`docs/REUSE.md`](docs/REUSE.md) | What can be reused from the other repositories |
-| [`docs/CONTRACT_INTERACTION.md`](docs/CONTRACT_INTERACTION.md) | How this project conflicts with the RoadPilot architecture contract, and what approval is needed |
+| [`docs/IMPORT_PROVENANCE.md`](docs/IMPORT_PROVENANCE.md) | What was imported from RoadPilot-Offline-Data, what was removed, what was verified |
 | [`AGENTS.md`](AGENTS.md), [`CHAT_HANDOFF.md`](CHAT_HANDOFF.md) | Continuity rules and current state for resuming work |
 
 ## Related repositories
